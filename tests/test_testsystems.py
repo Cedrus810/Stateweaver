@@ -20,11 +20,17 @@ def test_fe_hexaaqua_geometry():
 
 
 @pytest.mark.parametrize("name, natm, charge, spin", [
-    ("water", 3, 0, 0), ("water_dimer", 6, 0, 0), ("fe_hexaaqua", 19, 2, 4)])
+    ("water", 3, 0, 0), ("water_dimer", 6, 0, 0), ("fe2_hexaaqua", 19, 2, 4), ("fe3_hexaaqua", 19, 3, 5)])
 def test_build(name, natm, charge, spin):
     mol = build(name, "sto-3g")
     assert (mol.natm, mol.charge, mol.spin) == (natm, charge, spin)
     assert name in DEFAULT_METHOD
+
+
+def test_fe3_hexaaqua_uses_the_shorter_fe_o_bond():
+    mol = build("fe3_hexaaqua", "sto-3g")
+    fe_o = np.linalg.norm(mol.atom_coords(unit="Angstrom")[1] - mol.atom_coords(unit="Angstrom")[0])
+    assert fe_o == pytest.approx(2.00)
 
 
 def test_unknown_system_raises():

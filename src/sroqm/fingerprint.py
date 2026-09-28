@@ -65,11 +65,15 @@ def compare(a: Fingerprint, b: Fingerprint) -> FingerprintChange:
     )
 
 
-def frontier_gap(mo_energy, mo_occ) -> float:
+def frontier_gaps(mo_energy, mo_occ) -> tuple[float, ...]:
+    """Per spin channel: min(virtual eps) - max(occupied eps); negative means non-aufbau, inf if undefined."""
     e = np.asarray(mo_energy)
     occ = np.asarray(mo_occ)
     if e.ndim == 1:
         e, occ = e[None], occ[None]
-    gaps = [float(es[os == 0].min() - es[os > 0].max())
-            for es, os in zip(e, occ) if (os > 0).any() and (os == 0).any()]
-    return min(gaps, key=abs) if gaps else float("inf")
+    return tuple(float(es[os == 0].min() - es[os > 0].max()) if (os > 0).any() and (os == 0).any()
+                 else float("inf") for es, os in zip(e, occ))
+
+
+def frontier_gap(mo_energy, mo_occ) -> float:
+    return min(frontier_gaps(mo_energy, mo_occ), key=abs)

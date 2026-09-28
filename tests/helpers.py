@@ -25,3 +25,16 @@ def lowdin_density_error(dm, frame):
     diff = np.asarray(dm) - frame.dm
     diff = diff if diff.ndim == 3 else diff[None]
     return float(np.sqrt(sum(np.linalg.norm(h @ d @ h) ** 2 for d in diff)))
+
+
+def ethylene(theta_deg, basis="6-31g"):
+    """C2H4 with one CH2 group twisted by theta about the C=C axis; 0 and 180 degrees are the same molecule."""
+    from pyscf import gto
+
+    t = np.radians(theta_deg)
+    cc, ch, a = 0.667, 1.085, np.radians(121.5)
+    hy, hz = ch * np.sin(a), cc - ch * np.cos(a)
+    atoms = [("C", (0, 0, cc)), ("C", (0, 0, -cc)), ("H", (0, hy, hz)), ("H", (0, -hy, hz))]
+    for s in (1, -1):
+        atoms.append(("H", (-s * hy * np.sin(t), s * hy * np.cos(t), -hz)))
+    return gto.M(atom=atoms, basis=basis, verbose=0)

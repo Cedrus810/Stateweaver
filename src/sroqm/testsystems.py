@@ -15,7 +15,11 @@ H  1.680398 -0.373741 -0.758561
 H  1.680398 -0.373741  0.758561
 """
 
-DEFAULT_METHOD = {"water": "rks/b3lyp", "water_dimer": "rks/b3lyp", "fe_hexaaqua": "uks/b3lyp"}
+# fe3_hexaaqua: high-spin d5, 6A1g, orbitally non-degenerate -> the Phase-1 transition-metal benchmark.
+# fe2_hexaaqua: high-spin d6, 5T2g, three near-degenerate t2g occupations -> a state-tracking stress test
+#               (continuation sat up to 1.75 mHa above another occupation without any overlap alarm).
+DEFAULT_METHOD = {"water": "rks/b3lyp", "water_dimer": "rks/b3lyp",
+                  "fe2_hexaaqua": "uks/b3lyp", "fe3_hexaaqua": "uks/b3lyp"}
 
 
 def fe_hexaaqua_atoms(fe_o: float = 2.12, o_h: float = 0.96, hoh_deg: float = 104.5):
@@ -39,6 +43,8 @@ def build(name: str, basis: str) -> gto.Mole:
         return gto.M(atom=WATER, basis=basis, verbose=0)
     if name == "water_dimer":
         return gto.M(atom=WATER_DIMER, basis=basis, verbose=0)
-    if name == "fe_hexaaqua":
+    if name == "fe2_hexaaqua":
         return gto.M(atom=fe_hexaaqua_atoms(), basis=basis, charge=2, spin=4, verbose=0)
+    if name == "fe3_hexaaqua":
+        return gto.M(atom=fe_hexaaqua_atoms(fe_o=2.00), basis=basis, charge=3, spin=5, verbose=0)
     raise ValueError(f"unknown system {name!r}; expected one of {sorted(DEFAULT_METHOD)}")

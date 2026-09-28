@@ -70,6 +70,19 @@ def test_grassmann_falls_back_to_read_on_orbital_swap(water_frames):
     assert np.allclose(dm, water_frames[2].dm)
 
 
+def test_grassmann_falls_back_when_a_history_frame_is_far_rotated(water_frames):
+    # an 80-degree HOMO/LUMO rotation is not singular, but extrapolating through it is garbage
+    f = water_frames[1]
+    C = f.mo_coeff.copy()
+    homo = np.flatnonzero(f.mo_occ)[-1]
+    a = np.radians(80.0)
+    h, l = C[:, homo].copy(), C[:, homo + 1].copy()
+    C[:, homo], C[:, homo + 1] = np.cos(a) * h + np.sin(a) * l, -np.sin(a) * h + np.cos(a) * l
+    rotated = Frame.from_orbitals(f.mol, C, f.mo_occ)
+    dm = GrassmannGuess(order=3).guess((water_frames[2], rotated, water_frames[0]), water_frames[3].mol)
+    assert np.allclose(dm, water_frames[2].dm)
+
+
 def test_unrestricted_guess_with_empty_beta_channel():
     h = gto.M(atom="H 0 0 0", basis="6-31g", spin=1, verbose=0)
     step = np.array([[0.0, 0.0, 0.01]])

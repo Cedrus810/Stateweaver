@@ -64,19 +64,22 @@ class GrassmannGuess:
 
     Per spin channel: Y_i = S_i^{1/2} C_occ,i; tangent vectors Log_{Y_0}(Y_i) are combined
     with extrapolation coefficients, mapped back with Exp, and C = S_new^{-1/2} Y.
-    With one history frame, or if a Log fails (orbital swap in the history), it returns
-    the latest density: a bare Löwdin transfer is a worse guess than plain reuse.
+    With one history frame, or if some history frame's occupied space is rotated by more than
+    arccos(min_overlap) against the latest one (a swap or near-swap), it returns the latest
+    density: a bare Löwdin transfer is a worse guess than plain reuse, and extrapolating
+    through a near-swap is garbage.
     """
 
     _SCHEMES = {"polynomial": polynomial_coefficients, "aspc": aspc_coefficients}
 
-    def __init__(self, order: int = 3, scheme: str = "polynomial"):
+    def __init__(self, order: int = 3, scheme: str = "polynomial", min_overlap: float = 0.5):
         if order < 1:
             raise ValueError("order must be >= 1")
         if scheme not in self._SCHEMES:
             raise ValueError(f"unknown scheme {scheme!r}; expected one of {sorted(self._SCHEMES)}")
         self.order = order
         self.scheme = scheme
+        self.min_overlap = min_overlap
 
     def guess(self, history, mol):
         if not history:
@@ -91,7 +94,7 @@ class GrassmannGuess:
         dms = []
         for s, (ref, occv) in enumerate(per_frame[0]):
             try:
-                gamma = sum(c * grassmann_log(ref, per_frame[j][s][0])
+                gamma = sum(c * grassmann_log(ref, per_frame[j][s][0], tol=self.min_overlap)
                             for j, c in enumerate(coeffs) if j > 0)
             except GrassmannLogError:
                 return history[0].dm.copy()
