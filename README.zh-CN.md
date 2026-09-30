@@ -1,6 +1,6 @@
 # sroqm — 有状态的约化阶 QM/MM 引擎
 
-[English](README.md) | 简体中文
+[English](README.md) | 简体中文 | [日本語](README.ja.md)
 
 `sroqm` 是构建在 [PySCF](https://github.com/pyscf/pyscf) 之上的有状态电子结构引擎，面向 QM/MM
 分子动力学。普通 SCF 每步从初猜重新收敛，落在哪个解上算哪个；`sroqm` 面向的则是必须**停留在某条
@@ -28,8 +28,9 @@ SCF 解（scratch/aufbau 加上每种金属 d 占据，用 MOM 收敛）；`Beam
 
 已实现设计规范（[中文](<Stateful Reduced-Order QM-MM：核空间与电子空间的双层自动化框架.md>)）中的
 Phase 1（continuation 基线）、Phase 2（单 lineage 有状态引擎）和 Phase 3a（态搜索 + 多 lineage
-beam）。尚未实现：Phase 3b（搜索中加入相邻多重度和破对称候选、按 d 流形限制 lineage 数、对称性
-破缺后的搜索调度）、XL-BOMD、MM 端梯度 / OpenMM 耦合、ORCA 后端。
+beam）。Phase 3b（近简并流形上的 beam 卫生规则与发现调度：逐 lineage 循环预算、候选准入测试、
+丢失/休眠语义、刷新调度、两层完整搜索、显式 DEGENERATE 输出）设计已定稿、尚未实现。XL-BOMD、
+MM 端梯度 / OpenMM 耦合、ORCA 后端也未开始。相邻多重度（M±2）与破对称候选排在 Phase 3b 之后。
 
 ## 安装
 
@@ -92,6 +93,11 @@ res.switched, res.events              # 换根标志（有 cusp）；("spawn"|"r
 在 11 步 [Fe(H₂O)₆]²⁺ NVE 轨迹上：单 lineage 漂移最高 +0.4 mHa 且只会报告 `lower_state_found`
 而不切换；beam 设 `search_every=5`，第一次 alarm 触发搜索之后一直停在最低态（+0.004 mHa 以内）。
 
+近简并流形上的已知限制（Phase 3b 要解决的）：只有 `search_every=1` 才能从第一步起就停在最低态，
+更稀的调度会在对称性破缺初期漏掉几步；keep window（默认 8 mHa）远大于 t₂g 劈裂，beam 会被近简并
+变体占满；单层搜索可能整个漏掉最低态。这类流形上 `conv_tol` 应保持 1e-7 或更严——1e-6 会在软方向
+上提前判收敛，分不开 0.1 mHa 量级的态。
+
 ### 单几何态搜索
 
 ```python
@@ -146,8 +152,10 @@ PYTHONPATH=src python benchmarks/bench_continuation.py --system fe3_hexaaqua --b
 
 ## 路线图
 
-- Phase 3b：搜索中加入相邻多重度（M±2）与破对称候选；按 d 流形限制 lineage 数，避免近简并变体
-  占满 beam；对称性破缺后的搜索调度。
+- Phase 3b：lineage 卫生规则（逐 lineage 循环预算、候选准入测试、丢失/休眠语义）与发现调度
+  （刷新间隔、两层完整搜索），DEGENERATE 输出，容差与验收判据对齐；默认单节点。
+- 搜索候选扩展：相邻多重度（M±2）、broken-symmetry 片段、stability following。
+- 跨机任务级分发（原型已验证，40 核约 47–68 s/步）。
 - XL-BOMD。
 - MM 端梯度与 OpenMM 耦合。
 - ORCA 后端。

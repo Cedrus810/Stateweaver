@@ -1,6 +1,6 @@
 # sroqm — Stateful Reduced-Order QM engine for QM/MM
 
-English | [简体中文](README.zh-CN.md)
+English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 `sroqm` is a stateful electronic-structure engine built on [PySCF](https://github.com/pyscf/pyscf)
 for QM/MM molecular dynamics. A plain SCF restarts from a guess and lands wherever the guess takes
@@ -34,9 +34,11 @@ them — and returns energy and forces of the lowest one.
 Implements Phase 1 (continuation baseline), Phase 2 (single-lineage stateful engine) and Phase 3a
 (state search + multi-lineage beam) of the
 [design spec](<Stateful Reduced-Order QM-MM：核空间与电子空间的双层自动化框架.md>) (Chinese).
-Not yet implemented: Phase 3b (neighbouring multiplicities and broken-symmetry candidates in the
-search, per-manifold lineage caps, search scheduling after symmetry breaking), XL-BOMD, MM-side
-gradients / OpenMM coupling, ORCA backend.
+Phase 3b — beam hygiene rules and discovery scheduling on near-degenerate manifolds (per-lineage
+SCF budgets, a candidate admission test, lost/dormant semantics, refresh scheduling, a two-layer
+full search, explicit DEGENERATE output) — is designed but not yet implemented. Not started:
+XL-BOMD, MM-side gradients / OpenMM coupling, ORCA backend. Search candidates from neighbouring
+multiplicities (M±2) and broken-symmetry solutions are planned after Phase 3b.
 
 ## Installation
 
@@ -100,6 +102,13 @@ On an 11-step [Fe(H₂O)₆]²⁺ NVE trajectory, the beam with `search_every=5`
 state to within +0.004 mHa once the first alarm-triggered search fires, while a single lineage
 drifts up to +0.4 mHa and only *reports* `lower_state_found` without switching.
 
+Known limitations on near-degenerate manifolds (what Phase 3b addresses): only `search_every=1`
+holds the lowest state from the very first step — sparser schedules miss the first steps after
+symmetry breaking; the keep window (default 8 mHa) far exceeds the t₂g splitting, so the beam can
+fill up with near-degenerate variants; and a single search layer can miss the lowest state
+entirely. On these manifolds keep `conv_tol` at 1e-7 or tighter — at 1e-6 the SCF declares
+convergence halfway along the soft directions and cannot separate 0.1 mHa states.
+
 ### One-geometry state search
 
 ```python
@@ -157,9 +166,12 @@ hence the beam, which avoids re-converging the wrong state.
 
 ## Roadmap
 
-- Phase 3b: neighbouring multiplicities (M±2) and broken-symmetry candidates in the search;
-  capping lineages per d-manifold so near-degenerate variants don't fill the beam; search
-  scheduling after symmetry breaking.
+- Phase 3b: lineage hygiene rules (per-lineage SCF budgets, a candidate admission test,
+  lost/dormant semantics) and discovery scheduling (refresh intervals, two-layer full search),
+  with DEGENERATE output and tolerances matched to the acceptance criteria; single node by default.
+- Search-candidate extensions: neighbouring multiplicities (M±2), broken-symmetry fragments,
+  stability following.
+- Cross-machine task-level dispatch (prototyped, ~47–68 s/step at 40 cores).
 - XL-BOMD.
 - MM-side gradients and OpenMM coupling.
 - ORCA backend.
