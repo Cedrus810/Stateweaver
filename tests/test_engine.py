@@ -6,7 +6,8 @@ import pytest
 from helpers import ethylene, geometry_series
 from sroqm.alarms import AlarmThresholds
 from sroqm.backend import MethodSpec, PySCFBackend
-from sroqm.engine import Engine, Status
+from sroqm.engine import Budget, Engine, Status
+from sroqm.executor import run_task
 from sroqm.extrapolate import GrassmannGuess, ScratchGuess
 from sroqm.frame import Frame
 
@@ -176,3 +177,60 @@ def test_lineage_bookkeeping(water, water_step):
     assert len(eng.lineage.history) == 2
     assert len(eng.lineage.energies) == 4
     assert eng.lineage.multiplicity == 1
+
+
+def test_budget_without_gradient_returns_no_forces(water, water_step):
+    eng = Engine(water, rks())
+    eng.compute(water.atom_coords())
+    res = eng.compute(water.atom_coords() + water_step, budget=Budget(with_gradient=False))
+    full = Engine(water, rks()).compute(water.atom_coords() + water_step)
+    assert res.forces is None
+    assert res.energy == pytest.approx(full.energy, abs=1e-8)
+
+
+def test_budget_caps_scf_cycles(water):
+    res = Engine(water, PySCFBackend(MethodSpec("rks/b3lyp", conv_tol=1e-12))).compute(
+        water.atom_coords(), budget=Budget(max_cycle=1))
+    assert res.scf_iterations <= 1
+    assert "scf_not_converged" in {a.name for a in res.alarms}
+
+
+def test_budget_can_forbid_the_aufbau_fallback(water, water_step):
+    eng = Engine(water, IMOMNeverConverges(MethodSpec("rks/b3lyp", conv_tol=1e-10)))
+    eng.compute(water.atom_coords())
+    res = eng.compute(water.atom_coords() + water_step, budget=Budget(allow_fallback=False))
+    names = {a.name for a in res.alarms}
+    assert not res.converged
+    assert "scf_not_converged" in names and "imom_fallback" not in names
+
+
+def test_prepare_then_finish_equals_compute(water, water_step):
+    a, b = Engine(water, rks()), Engine(water, rks())
+    for x in (water.atom_coords(), water.atom_coords() + water_step):
+        task = a.prepare(x)
+        ra = a.finish(task, run_task(a.backend, task))
+        rb = b.compute(x)
+        assert ra.energy == pytest.approx(rb.energy, abs=1e-10)
+        assert np.allclose(ra.forces, rb.forces, atol=1e-8)
+    assert task.imom_ref is a.lineage.history[1]  # the second step was pinned to the first frame
+
+
+def test_gradient_reseat_gives_the_full_step_forces_without_a_new_scf(water, water_step):
+    x = water.atom_coords() + water_step
+    eng = Engine(water, rks())
+    eng.compute(x, budget=Budget(with_gradient=False))
+    r = run_task(eng.backend, eng.gradient_task())
+    assert r.cycles <= 2
+    assert np.allclose(Engine.forces_from(r), Engine(water, rks()).compute(x).forces, atol=1e-6)
+
+
+def test_forces_from_refuses_an_unconverged_reseat(water):
+    eng = Engine(water, IMOMNeverConverges(MethodSpec("rks/b3lyp", conv_tol=1e-10)))
+    eng.compute(water.atom_coords(), budget=Budget(with_gradient=False))
+    with pytest.raises(RuntimeError, match="re-seat"):
+        Engine.forces_from(run_task(eng.backend, eng.gradient_task()))
+
+
+def test_gradient_task_needs_a_frame(water):
+    with pytest.raises(RuntimeError):
+        Engine(water, rks()).gradient_task()

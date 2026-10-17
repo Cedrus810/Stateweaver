@@ -1,17 +1,17 @@
 """Stateful QM force engine, single-lineage (FAST mode): spec §12, §19."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import numpy as np
 
 from sroqm.alarms import Alarm, AlarmThresholds, evaluate_alarms
 from sroqm.backend import PySCFBackend
+from sroqm.executor import SCFTask, TaskResult, run_task
 from sroqm.extrapolate import Extrapolator, GrassmannGuess
 from sroqm.fingerprint import compare, compute_fingerprint, frontier_gaps
 from sroqm.frame import Frame
-from sroqm.imom import make_imom_hook
 from sroqm.lineage import Lineage
 from sroqm.overlap import occupied_overlap
 
@@ -23,11 +23,23 @@ class Status(Enum):
     ALARM = "ALARM"  # Phase 3 hooks STATE_SEARCH here
 
 
+@dataclass(frozen=True)
+class Budget:
+    """What one step of a lineage may spend (Phase-3b spec §4.2). The defaults are the plain engine's behavior."""
+    max_cycle: int | None = None   # None: the backend's MethodSpec.max_cycle
+    allow_fallback: bool = True    # redo an unconverged IMOM step with aufbau
+    with_gradient: bool = True
+
+    def __post_init__(self):
+        if self.max_cycle is not None and self.max_cycle < 1:
+            raise ValueError(f"max_cycle must be >= 1 or None, got {self.max_cycle}")
+
+
 @dataclass(frozen=True, eq=False)
 class Result:
     step: int
     energy: float
-    forces: np.ndarray
+    forces: np.ndarray | None  # None when the step's Budget skipped the gradient
     status: Status
     lineage_id: int
     s2: float
@@ -70,54 +82,62 @@ class Engine:
             self._seed = Frame.from_orbitals(template, mo_coeff, mo_occ)
         self.step = 0
 
-    def compute(self, coords_bohr, point_charges=None) -> Result:
+    def compute(self, coords_bohr, point_charges=None, budget: Budget | None = None) -> Result:
+        task = self.prepare(coords_bohr, point_charges, budget)
+        result = run_task(self.backend, task)
+        probe_energy = None
+        if self.probe_every is not None and self.step % self.probe_every == 0:
+            probe = self.backend.run(task.mol, point_charges=point_charges, with_gradient=False)
+            probe_energy = probe.energy if probe.converged else None
+        return self.finish(task, result, probe_energy)
+
+    def _history(self) -> tuple:
+        return self.lineage.history or ((self._seed,) if self._seed is not None else ())
+
+    def prepare(self, coords_bohr, point_charges=None, budget: Budget | None = None) -> SCFTask:
+        """The SCF of the next step as a task; run it anywhere, then hand the result to finish()."""
+        b = budget if budget is not None else Budget()
         coords = np.asarray(coords_bohr, dtype=float)
         if coords.shape != (self.template.natm, 3):
             raise ValueError(f"coords shape {coords.shape} != ({self.template.natm}, 3)")
         mol = self.template.set_geom_(coords, unit="Bohr", inplace=False)
-
-        history = self.lineage.history or ((self._seed,) if self._seed is not None else ())
+        history = self._history()
         dm0 = self.extrapolator.guess(history, mol) if history else None
-        hook = make_imom_hook(history[0], mol) if history and self.continuation == "imom" else None
-        out = self.backend.run(mol, dm0=dm0, occ_hook=hook, point_charges=point_charges)
-        cycles, imom_fallback = out.cycles, False
-        if hook is not None and not out.converged:
-            # IMOM pinned to a state that is no longer an SCF minimum; redo the step with aufbau
-            retry = self.backend.run(mol, dm0=dm0, point_charges=point_charges)
-            cycles += retry.cycles
-            if retry.converged:
-                out, imom_fallback = retry, True
+        ref = history[0] if history and self.continuation == "imom" else None
+        return SCFTask(mol=mol, dm0=dm0, imom_ref=ref, max_cycle=b.max_cycle,
+                       allow_fallback=b.allow_fallback and ref is not None, with_gradient=b.with_gradient,
+                       point_charges=point_charges, tag="advance")
 
-        probe_energy = None
-        if self.probe_every is not None and self.step % self.probe_every == 0:
-            probe = self.backend.run(mol, point_charges=point_charges, with_gradient=False)
-            probe_energy = probe.energy if probe.converged else None
-
-        frame = Frame.from_outcome(mol, out)
+    def finish(self, task: SCFTask, result: TaskResult, probe_energy: float | None = None) -> Result:
+        """Record `result` as this step. `task` must be this engine's last prepare(), with no other step in between."""
+        history = self._history()
+        out, mol = result.outcome, task.mol
+        frame = result.frame
         fp = compute_fingerprint(out.mf, self.fragments)
         prev_fp = self.lineage.last_fingerprint
+        self._last_context = (history[0] if history else None, prev_fp, self.lineage.last_gaps)
         change = compare(prev_fp, fp) if prev_fp is not None else None
         overlap = occupied_overlap(history[0], frame) if history else None
         gaps = frontier_gaps(out.mo_energy, out.mo_occ)
         gap = min(gaps, key=abs)
-        alarms = evaluate_alarms(converged=out.converged, cycles=cycles if history else None, gap=gap,
+        alarms = evaluate_alarms(converged=out.converged, cycles=result.cycles if history else None, gap=gap,
                                  change=change, overlap=overlap, thresholds=self.thresholds,
-                                 gaps=gaps, prev_gaps=self.lineage.last_gaps, imom_fallback=imom_fallback,
+                                 gaps=gaps, prev_gaps=self.lineage.last_gaps, imom_fallback=result.fallback,
                                  probe_delta=out.energy - probe_energy if probe_energy is not None else None)
         self.lineage.push(frame, fp, gaps)
         if any(a.name == "overlap_drop" for a in alarms):
             self.lineage.cut_history()  # the old state's frames would poison the next extrapolation
 
-        result = Result(
+        res = Result(
             step=self.step,
             energy=out.energy,
-            forces=-out.gradient,
+            forces=-out.gradient if out.gradient is not None else None,
             status=Status.ALARM if alarms else Status.FAST,
             lineage_id=self.lineage.id,
             s2=fp.s2,
             local_spins=fp.fragment_spins,
             local_charges=fp.fragment_charges,
-            scf_iterations=cycles,
+            scf_iterations=result.cycles,
             converged=out.converged,
             overlap_det=overlap.det if overlap else None,
             overlap_min_sv=overlap.min_sv if overlap else None,
@@ -126,4 +146,50 @@ class Engine:
             probe_energy=probe_energy,
         )
         self.step += 1
-        return result
+        return res
+
+    def finish_gradient(self, previous: Result, result: TaskResult) -> Result:
+        """Replace the current step after a validated re-seat, without advancing or pushing a second frame."""
+        if previous.step != self.step - 1 or previous.lineage_id != self.lineage.id:
+            raise ValueError("gradient result must replace this lineage's current step")
+        forces = self.forces_from(result)
+        frame = result.frame
+        fp = compute_fingerprint(result.outcome.mf, self.fragments)
+        prev_frame, prev_fp, prev_gaps = self._last_context
+        change = compare(prev_fp, fp) if prev_fp is not None else None
+        overlap = occupied_overlap(prev_frame, frame) if prev_frame is not None else None
+        gaps = frontier_gaps(result.outcome.mo_energy, result.outcome.mo_occ)
+        gap = min(gaps, key=abs)
+        cycles = previous.scf_iterations + result.cycles
+        alarms = evaluate_alarms(
+            converged=result.converged, cycles=cycles if prev_frame is not None else None, gap=gap,
+            change=change, overlap=overlap, thresholds=self.thresholds, gaps=gaps, prev_gaps=prev_gaps,
+            imom_fallback=any(a.name == "imom_fallback" for a in previous.alarms),
+            probe_delta=frame.energy - previous.probe_energy if previous.probe_energy is not None else None,
+        )
+        self.lineage.frames[0] = frame
+        self.lineage.fingerprints[-1] = fp
+        self.lineage.energies[-1] = frame.energy
+        self.lineage.gaps[-1] = gaps
+        if any(a.name == "overlap_drop" for a in alarms):
+            self.lineage.cut_history()
+        return replace(previous, energy=frame.energy, forces=forces, s2=fp.s2,
+                       local_spins=fp.fragment_spins, local_charges=fp.fragment_charges,
+                       scf_iterations=cycles, frontier_gap=gap, alarms=alarms,
+                       status=Status.ALARM if alarms else Status.FAST,
+                       overlap_det=overlap.det if overlap else None,
+                       overlap_min_sv=overlap.min_sv if overlap else None)
+
+    def gradient_task(self, point_charges=None, max_cycle: int | None = 10) -> SCFTask:
+        """Re-seat the last frame (IMOM on itself, from its own density) and compute its gradient (spec §4.6)."""
+        last = self.lineage.last_frame
+        if last is None:
+            raise RuntimeError("no frame yet: compute a step first")
+        return SCFTask(mol=last.mol, dm0=last.dm, imom_ref=last, max_cycle=max_cycle, with_gradient=True,
+                       point_charges=point_charges, tag="reseat")
+
+    @staticmethod
+    def forces_from(result: TaskResult) -> np.ndarray:
+        if not result.converged:
+            raise RuntimeError("gradient re-seat did not converge")
+        return -np.asarray(result.outcome.gradient)

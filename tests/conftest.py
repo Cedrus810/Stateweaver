@@ -6,6 +6,26 @@ from pyscf import gto, lib
 
 lib.num_threads(int(os.environ.get("OMP_NUM_THREADS", "4")))
 
+# Every test that needs the [Fe(H2O)6]2+ SCF (minutes each) depends on this fixture, directly or through another one.
+SLOW_FIXTURES = frozenset({"fe2_distorted"})
+
+
+def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true", help="also run the [Fe(H2O)6]2+ SCF tests (minutes each)")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: needs the [Fe(H2O)6]2+ SCF; skipped unless --runslow")
+
+
+def pytest_collection_modifyitems(config, items):
+    skip = pytest.mark.skip(reason="[Fe(H2O)6]2+ SCF test: run with --runslow")
+    for item in items:
+        if SLOW_FIXTURES & set(getattr(item, "fixturenames", ())):
+            item.add_marker("slow")
+            if not config.getoption("--runslow"):
+                item.add_marker(skip)
+
 WATER = "O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587"
 O2 = "O 0 0 0; O 0 0 1.21"
 
