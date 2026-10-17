@@ -29,7 +29,7 @@ def grassmann_log(Y0: np.ndarray, Y1: np.ndarray, tol: float = 1e-6) -> np.ndarr
     M = Y0.T @ Y1
     if np.linalg.svd(M, compute_uv=False).min() < tol:
         raise GrassmannLogError("occupied subspaces are (near-)orthogonal in some direction")
-    A = (Y1 - Y0 @ M) @ np.linalg.inv(M)
+    A = np.linalg.solve(M.T, (Y1 - Y0 @ M).T).T
     U, s, Vt = np.linalg.svd(A, full_matrices=False)
     return (U * np.arctan(s)) @ Vt
 

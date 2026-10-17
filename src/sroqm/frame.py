@@ -18,6 +18,11 @@ def occupied_blocks(mo_coeff, mo_occ) -> list[tuple[np.ndarray, float]]:
     return [(C[s][:, occ[s] > 0], 1.0) for s in range(2)]
 
 
+def _density(mo_coeff, mo_occ):
+    dms = [occv * C @ C.T for C, occv in occupied_blocks(mo_coeff, mo_occ)]
+    return dms[0] if mo_coeff.ndim == 2 else np.stack(dms)
+
+
 @dataclass(frozen=True, eq=False)
 class Frame:
     mol: gto.Mole
@@ -37,11 +42,18 @@ class Frame:
         mo_coeff = np.asarray(mo_coeff, dtype=float)
         mo_occ = np.asarray(mo_occ, dtype=float)
         if dm is None:
-            dms = [occv * C @ C.T for C, occv in occupied_blocks(mo_coeff, mo_occ)]
-            dm = dms[0] if mo_coeff.ndim == 2 else np.stack(dms)
+            dm = _density(mo_coeff, mo_occ)
         ovlp = mol.intor_symmetric("int1e_ovlp")
         half, _ = lowdin_pair(ovlp)
         return cls(mol, mo_coeff, mo_occ, np.asarray(dm, dtype=float), float(energy), ovlp, half)
+
+    def with_occupations(self, mo_occ) -> "Frame":
+        """A guess on these orbitals and geometry; reuse the geometry's overlap and Löwdin factor."""
+        mo_occ = np.asarray(mo_occ, dtype=float).copy()
+        if mo_occ.shape != self.mo_occ.shape:
+            raise ValueError(f"occupation shape {mo_occ.shape} != {self.mo_occ.shape}")
+        return Frame(self.mol, self.mo_coeff, mo_occ, _density(self.mo_coeff, mo_occ),
+                     float("nan"), self.ovlp, self.ovlp_half)
 
     @classmethod
     def from_outcome(cls, mol, outcome) -> "Frame":
