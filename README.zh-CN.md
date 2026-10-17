@@ -21,15 +21,18 @@ alarm——`gap_sign_flip`、`overlap_drop`、`imom_fallback`、`lower_state_fou
 
 **多态 beam。** 近简并流形上单条 lineage 不够用：高自旋 [Fe(H₂O)₆]²⁺（⁵T₂g）的三个 t₂g 占据彼此
 只差 0.5 mHa 以内，SCF 基本上随机落进其中一个。`search_states` 在单一几何上枚举不同的低 lying
-SCF 解（scratch/aufbau 加上每种金属 d 占据，用 MOM 收敛）；`BeamEngine` 同时保活至多
-`max_lineages` 条竞争 lineage——spawn、revive、merge、prune——并返回最低态的能量和力。
+SCF 解（scratch/aufbau 加上每种金属 d 占据，用 MOM 收敛）；
+`BeamEngine(mol, backend, metal_atoms=[0])` 在 Phase 3b 的卫生规则下（按能隙分配预算、重新收敛的准入测试、丢态后复活、两层完整搜索、按计划刷新）最多保留 `BeamParams.max_lineages` 条 lineage，返回最低那条的能量和力；两条 lineage 相差不到 `Tolerances.deg_band`（0.1 mHa）时，`BeamResult.status` 为 `DEGENERATE`。所有容差集中在 `sroqm.tolerances.Tolerances`，后端的 `conv_tol` 必须与之一致（默认 1e-7）。
 
 ### 进度
 
 已实现设计规范（[中文](<Stateful Reduced-Order QM-MM：核空间与电子空间的双层自动化框架.md>)）中的
 Phase 1（continuation 基线）、Phase 2（单 lineage 有状态引擎）和 Phase 3a（态搜索 + 多 lineage
 beam）。Phase 3b（近简并流形上的 beam 卫生规则与发现调度：逐 lineage 循环预算、候选准入测试、
-丢失/休眠语义、刷新调度、两层完整搜索、显式 DEGENERATE 输出）设计已定稿、尚未实现。XL-BOMD、
+丢失/休眠语义、刷新调度、两层完整搜索、显式 DEGENERATE 输出）已按 2026-10-02 与 2026-10-05 的
+实施计划实现，对照 ref3 的验收尚未通过：traj2 第 0–20 步 4 / 4 次回放全过（这一版第 21–59 步未回放），
+对称起点 2 次里 1 次漏；含完整搜索的步骤占总时间 68–88%（见 `state.md` §4.15 与
+`docs/2026-10-11-search-performance-design.zh-CN.md`）。XL-BOMD、
 MM 端梯度 / OpenMM 耦合、ORCA 后端也未开始。相邻多重度（M±2）与破对称候选排在 Phase 3b 之后。
 
 ## 安装
@@ -78,16 +81,17 @@ continuation：`imom`）。开壳层体系要用 `uhf`/`uks` 方法。
 
 ```python
 from sroqm.beam import BeamEngine
+from sroqm.beamrules import BeamParams
 
 beam = BeamEngine(
     mol,
     PySCFBackend(MethodSpec("uks/b3lyp", density_fit=True)),
     metal_atoms=[0],
-    search_every=5,   # gap_sign_flip / overlap_drop / imom_fallback 时也会触发搜索
+    params=BeamParams(search_every=5),  # gap_sign_flip / overlap_drop / imom_fallback 时也会触发搜索
 )
 res = beam.compute(coords)            # 最低 lineage 的 E/F（policy="adiabatic_min"）
 res.lineage_energies                  # 保活的所有 lineage（按 id）
-res.switched, res.events              # 换根标志（有 cusp）；("spawn"|"revive"|"merge"|"dormant", id)
+res.switched, res.events              # 换根标志（有 cusp）；事件类型见 Phase 3b spec §6
 ```
 
 在 11 步 [Fe(H₂O)₆]²⁺ NVE 轨迹上：单 lineage 漂移最高 +0.4 mHa 且只会报告 `lower_state_found`
@@ -140,9 +144,13 @@ PYTHONPATH=src python benchmarks/bench_continuation.py --system fe3_hexaaqua --b
 | `grassmann.py`、`frame.py`、`extrapolate.py` | Löwdin + Grassmann log/exp；电子帧；四种初猜外推 |
 | `overlap.py`、`imom.py` | 跨几何占据空间重叠（det 与 σ_min）；IMOM 续算 |
 | `fingerprint.py`、`alarms.py` | 旋转不变 fingerprint、逐通道 frontier gap；Tier 0–2 alarm |
-| `lineage.py`、`engine.py` | 单 lineage 引擎（IMOM 回退、历史截断、定期探测） |
-| `search.py` | 单几何态搜索：scratch/aufbau + 金属 d 占据枚举（MOM） |
-| `beam.py` | 多 lineage beam：spawn / revive / merge / dormant / 满员替换 |
+| `lineage.py`、`engine.py` | 单 lineage 引擎（IMOM 回退、历史截断、定期探测；Budget、prepare/finish、梯度 re-seat） |
+| `tolerances.py` | 所有容差集中在一个冻结 dataclass，beam / 搜索 / 验收共用（spec §7） |
+| `executor.py` | 单次 SCF 即一个 `SCFTask`；`SerialExecutor` 按批执行（spec §8.1） |
+| `schedule.py` | 两段式 refresh 与其调度器：何时刷新、第二段预算（spec §5.1–5.2） |
+| `beamrules.py` | `BeamParams` 与纯决策规则：预算、丢失判定、准入槽位、strikes、复活资格、状态优先级（spec §4、§6） |
+| `search.py` | 单几何态搜索：scratch/aufbau + 金属 d 占据枚举（MOM）；两层完整搜索（spec §5.3–5.4） |
+| `beam.py` | Phase 3b 卫生规则下的多 lineage beam：advance → discover → admit → merge → select → prune |
 | `md.py`、`testsystems.py` | velocity-Verlet NVE 驱动；水、水二聚体、Fe³⁺/Fe²⁺ 六水合 |
 
 ## 设计文档

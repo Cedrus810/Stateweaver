@@ -25,9 +25,12 @@ independent scratch SCF every N steps to detect lower states the lineage cannot 
 **Multi-state beam.** For near-degenerate manifolds a single lineage is not enough: high-spin
 [Fe(H₂O)₆]²⁺ (⁵T₂g) has three t₂g occupations within 0.5 mHa of each other, and the SCF lands in
 one of them essentially at random. `search_states` enumerates the distinct low-lying SCF solutions
-at one geometry (scratch/aufbau plus every metal-d occupation, converged with MOM); `BeamEngine`
-keeps up to `max_lineages` competing lineages alive — spawning, reviving, merging and pruning
-them — and returns energy and forces of the lowest one.
+at one geometry (scratch/aufbau plus every metal-d occupation, converged with MOM);
+`BeamEngine(mol, backend, metal_atoms=[0])` keeps up to `BeamParams.max_lineages` lineages alive under the
+Phase-3b hygiene rules (budgets by gap, admission by re-convergence, revive after a loss, two-level full
+search, scheduled refresh) and returns the lowest one's energy and forces; `BeamResult.status` is
+`DEGENERATE` when two lineages are within `Tolerances.deg_band` (0.1 mHa). All tolerances live in
+`sroqm.tolerances.Tolerances`; the backend's `conv_tol` must match it (default 1e-7).
 
 ### Status
 
@@ -36,7 +39,11 @@ Implements Phase 1 (continuation baseline), Phase 2 (single-lineage stateful eng
 [design spec](<Stateful Reduced-Order QM-MM：核空间与电子空间的双层自动化框架.md>) (Chinese).
 Phase 3b — beam hygiene rules and discovery scheduling on near-degenerate manifolds (per-lineage
 SCF budgets, a candidate admission test, lost/dormant semantics, refresh scheduling, a two-layer
-full search, explicit DEGENERATE output) — is designed but not yet implemented. Not started:
+full search, explicit DEGENERATE output) — is implemented (plans 2026-10-02 and 2026-10-05) but has
+not passed acceptance against the ref3 references: traj2 steps 0–20 pass in 4 of 4 replays (steps
+21–59 not yet replayed with this version), the symmetric start fails in 1 of 2 replays, and steps
+with a full search take 68–88% of the wall time (see `state.md` §4.15 and
+`docs/2026-10-11-search-performance-design.zh-CN.md`). Not started:
 XL-BOMD, MM-side gradients / OpenMM coupling, ORCA backend. Search candidates from neighbouring
 multiplicities (M±2) and broken-symmetry solutions are planned after Phase 3b.
 
@@ -86,16 +93,17 @@ history (default continuation: `imom`). For open-shell systems use a `uhf`/`uks`
 
 ```python
 from sroqm.beam import BeamEngine
+from sroqm.beamrules import BeamParams
 
 beam = BeamEngine(
     mol,
     PySCFBackend(MethodSpec("uks/b3lyp", density_fit=True)),
     metal_atoms=[0],
-    search_every=5,   # also searches on gap_sign_flip / overlap_drop / imom_fallback
+    params=BeamParams(search_every=5),  # also searches on gap_sign_flip / overlap_drop / imom_fallback
 )
 res = beam.compute(coords)            # E/F of the lowest lineage (policy="adiabatic_min")
 res.lineage_energies                  # every lineage kept alive, by id
-res.switched, res.events              # cusp flag on switch; ("spawn"|"revive"|"merge"|"dormant", id)
+res.switched, res.events              # cusp flag on switch; event kinds per the Phase-3b spec §6
 ```
 
 On an 11-step [Fe(H₂O)₆]²⁺ NVE trajectory, the beam with `search_every=5` stays on the lowest
@@ -154,9 +162,13 @@ hence the beam, which avoids re-converging the wrong state.
 | `grassmann.py`, `frame.py`, `extrapolate.py` | Löwdin + Grassmann log/exp; orbital frames; the four initial-guess extrapolators |
 | `overlap.py`, `imom.py` | cross-geometry occupied-space overlap (det and σ_min); IMOM continuation |
 | `fingerprint.py`, `alarms.py` | rotation-invariant fingerprints, per-channel frontier gaps; Tier 0–2 alarms |
-| `lineage.py`, `engine.py` | single-lineage engine (IMOM fallback, history truncation, periodic probing) |
-| `search.py` | one-geometry state search: scratch/aufbau + metal-d occupation enumeration (MOM) |
-| `beam.py` | multi-lineage beam: spawn / revive / merge / dormant / capacity-replacing prune |
+| `lineage.py`, `engine.py` | single-lineage engine (IMOM fallback, history truncation, periodic probing; Budget, prepare/finish, gradient re-seat) |
+| `tolerances.py` | every tolerance of the beam in one frozen dataclass, shared by beam / search / acceptance (spec §7) |
+| `executor.py` | one SCF as a self-contained `SCFTask`; `SerialExecutor` runs batches of them (spec §8.1) |
+| `schedule.py` | two-stage refresh and its scheduler: when to refresh, the stage-2 budget (spec §5.1–5.2) |
+| `beamrules.py` | `BeamParams` and the pure decision rules: budgets, loss, admission slots, strikes, revive, status (spec §4, §6) |
+| `search.py` | one-geometry state search: scratch/aufbau + metal-d occupation enumeration (MOM); the two-level full search (spec §5.3–5.4) |
+| `beam.py` | multi-lineage beam under the Phase-3b hygiene rules: advance → discover → admit → merge → select → prune |
 | `md.py`, `testsystems.py` | velocity-Verlet NVE driver; water, water dimer, Fe³⁺/Fe²⁺ hexaaqua |
 
 ## Design documents
