@@ -26,10 +26,12 @@ from sroqm.beamrules import (BeamParams, admission_slot, advance_budget, is_lost
                              status_of, search_reason)
 from sroqm.engine import Budget, Engine, Result
 from sroqm.executor import SCFTask, SerialExecutor, TaskResult
+from sroqm.extrapolate import GrassmannGuess
 from sroqm.frame import Frame
 from sroqm.lineage import LineageStatus
+from sroqm.overlap import occupied_overlap
 from sroqm.schedule import RefreshScheduler, refresh
-from sroqm.search import d_occupation_patterns, full_search
+from sroqm.search import d_occupation_patterns, full_search, random_orientation_tasks
 from sroqm.tolerances import Tolerances
 
 class ReseatError(RuntimeError):
@@ -79,6 +81,13 @@ class _Member:
 
 
 @dataclass(frozen=True, eq=False)
+class _Carry:
+    """A search candidate still unconverged inside the window: continued on later steps (design 2026-10-11 §5.2)."""
+    frame: Frame    # its last frame (unconverged), at the geometry where it last ran
+    born: int       # the step whose search left it pending
+
+
+@dataclass(frozen=True, eq=False)
 class BeamResult:
     step: int
     energy: float
@@ -96,6 +105,7 @@ class BeamResult:
     trace: dict = field(default_factory=dict, repr=False)  # per-step diagnostics for benchmarks (spec 2026-10-05 §3.3)
     frames: dict = field(default_factory=dict, repr=False)  # every ACTIVE lineage's frame, by id
     energy_final: float | None = None               # energy_only + backend.finalize: the selected state's finish
+    search_frames: tuple = field(default=(), repr=False)  # start search: converged candidates in the window (2a)
 
 
 class BeamEngine:
@@ -125,6 +135,8 @@ class BeamEngine:
         self._search_next: str | None = None  # "reseat" / "escalate": search next step
         self._densify_until = -1   # last step of the densified discovery after a DEGENERATE start (design §7)
         self._unknown_streak = 0   # discovery steps in a row that left an unknown candidate
+        self._pending: list[_Carry] = []  # search candidates being continued (design 2026-10-11 §5.2)
+        self._same_log: list[dict] = []   # this step's same-state judgments (design memo 2026-10-23 §2.2 2a)
 
     # ---- helpers ---------------------------------------------------------------------------------------
     def _active(self) -> list[_Member]:
@@ -155,7 +167,7 @@ class BeamEngine:
         frame = engine.lineage.last_frame
         if revive_id is None:  # a DORMANT lineage on this state keeps its id (spec §4.1)
             revive_id = next((m.id for m in self.members if m.status is LineageStatus.DORMANT
-                              and m.seed is not None and self.tol.same_state(m.seed, frame)), None)
+                              and m.seed is not None and self._same(m.seed, frame, "revive_match")), None)
         if revive_id is not None:
             m = self._member(revive_id)
             m.engine, m.status, m.strikes, m.lost_step = engine, LineageStatus.ACTIVE, 0, None
@@ -175,9 +187,11 @@ class BeamEngine:
 
         Re-seating gets one full-budget retry if unconverged, then must satisfy the same state/energy
         criteria as admission. The default serial executor needs no re-seat SCF."""
-        # Custom executors keep the task protocol: they may run remotely or override map() semantics.
-        if type(self.executor) is SerialExecutor and m.scf_result is not None:
-            forces = -self.backend.gradient(m.scf_result.outcome)
+        # Custom executors keep the task protocol: they may run remotely or override map() semantics. The process
+        # executor keeps the SCF object on its worker: the gradient is computed there (design 2026-10-03 §9.2).
+        kept = m.scf_result
+        if kept is not None and (kept.handle is not None or type(self.executor) is SerialExecutor):
+            forces = -(kept.handle.gradient() if kept.handle is not None else self.backend.gradient(kept.outcome))
             if forces.shape != (self.template.natm, 3) or not np.all(np.isfinite(forces)):
                 raise ReseatError(f"lineage {m.id}: invalid reused gradient")
             m.result = dataclasses.replace(m.result, forces=forces)
@@ -190,23 +204,74 @@ class BeamEngine:
             raise ReseatError(f"lineage {m.id}: gradient re-seat did not converge ({res.cycles} cycles)")
         forces = m.engine.forces_from(res)
         de = res.outcome.energy - m.result.energy
-        if not (self.tol.same_state(m.frame, res.frame) and abs(de) < self.tol.admit_de
+        if not (self._same(m.frame, res.frame, "reseat") and abs(de) < self.tol.admit_de
                 and forces.shape == (self.template.natm, 3) and np.all(np.isfinite(forces))):
             raise ReseatError(f"lineage {m.id}: gradient re-seat left its state (dE = {de:.2e} Ha)")
         m.result = m.engine.finish_gradient(m.result, res)
         return forces
+
+    def _same(self, a: Frame, b: Frame, where: str) -> bool:
+        """Tolerances.same_state, and a record (sigma_min, E_b - E_a) of every pair it calls one state (design memo
+        2026-10-23 §2.2 2a: near B a distinct state sits at sigma 0.84-0.90). Decisions are unchanged."""
+        same = self.tol.same_state(a, b)
+        if same:
+            self._same_log.append(dict(where=where, sv=occupied_overlap(a, b).min_sv, de_mha=1e3 * (b.energy - a.energy)))
+        return same
 
     def _advance_budget(self, m: _Member):
         b = advance_budget(m.id == self._selected, m.gap_last, self.params)
         return dataclasses.replace(b, with_gradient=False) if self.energy_only else b
 
     # ---- one step --------------------------------------------------------------------------------------
+    _SCALARS = ("step", "_selected", "_followed", "_next_id", "_gap_prev", "_search_next", "_densify_until",
+                "_unknown_streak")
+    _NOTHING = object()
+
+    def _snapshot(self):
+        """Everything a step changes. The advance pushes frames into every lineage before discovery and forces; if a
+        later stage raises, compute() puts it all back so the same instance can be called again (review 2026-10-23
+        #3). Frames and results are immutable, so shallow copies of the containers are enough."""
+        def engine(e):
+            lin = e.lineage
+            return (e, e.step, getattr(e, "_last_context", self._NOTHING), lin.id, lin.birth_step, list(lin.frames),
+                    list(lin.fingerprints), list(lin.energies), list(lin.gaps))
+        members = [(m, {f.name: getattr(m, f.name) for f in dataclasses.fields(m)}, engine(m.engine))
+                   for m in self.members]
+        return (members, {k: getattr(self, k) for k in self._SCALARS}, list(self._pending),
+                dict(vars(self.scheduler)))
+
+    def _restore(self, snap) -> None:
+        members, scalars, pending, scheduler = snap
+        for m, fields, (e, step, context, lid, birth, frames, fps, energies, gaps) in members:
+            for k, v in fields.items():
+                setattr(m, k, v)
+            e.step, e.lineage.id, e.lineage.birth_step = step, lid, birth
+            if context is self._NOTHING:
+                e.__dict__.pop("_last_context", None)
+            else:
+                e._last_context = context
+            e.lineage.frames.clear()
+            e.lineage.frames.extend(frames)
+            e.lineage.fingerprints[:], e.lineage.energies[:], e.lineage.gaps[:] = fps, energies, gaps
+        self.members = [m for m, _, _ in members]
+        for k, v in scalars.items():
+            setattr(self, k, v)
+        self._pending = pending
+        self.scheduler.__dict__.clear()
+        self.scheduler.__dict__.update(scheduler)
+
     def compute(self, coords_bohr, point_charges=None) -> BeamResult:
+        snap = self._snapshot()
         try:
             return self._compute(coords_bohr, point_charges)
+        except BaseException:
+            self._restore(snap)  # a failed step leaves the beam as it was before the call
+            raise
         finally:
             for m in self.members:
                 m.scf_result = None  # also release PySCF grids/DF resources if discovery or gradients fail
+            if hasattr(self.executor, "release"):
+                self.executor.release()  # a process executor's workers drop this step's SCF objects
 
     def _compute(self, coords_bohr, point_charges=None) -> BeamResult:
         p, tol, step = self.params, self.tol, self.step
@@ -216,7 +281,9 @@ class BeamEngine:
         mol = self.template.set_geom_(coords, unit="Bohr", inplace=False)
         events: list[tuple[str, int | None]] = []
         self._ledger = ledger = _Ledger(self.executor)
-        trace = dict(advance=[], search=None, refresh=None, tasks=ledger.rows)
+        self._same_log = []
+        trace = dict(advance=[], search=None, refresh=None, tasks=ledger.rows, same_state=self._same_log)
+        search_frames = ()
 
         # 1. advance every ACTIVE lineage (spec §4.2-4.3)
         active = self._active()
@@ -241,7 +308,7 @@ class BeamEngine:
 
         # 2. discovery (spec §5, §4.3)
         cands: list[tuple[Frame, int | None]] = []
-        refreshed, pending = None, 0
+        refreshed, pending, new_pending = None, 0, ()
         reason = search_reason(step, len(active), selected_lost, sel_alarms, p.search_every) or self._search_next
         if reason is None and step <= self._densify_until:
             reason = "densify"
@@ -267,13 +334,24 @@ class BeamEngine:
             trace["search"] = dict(reason=reason, level1=sr.level1, level2=sr.level2, guesses=list(sr.guesses),
                                    n_states=len(sr.states), pending=sr.pending, screened=sr.screened,
                                    screened_mha=[[tag, 1e3 * de] for tag, de in sr.screened_de],
-                                   n_bases=len(bases), wide=wide)
+                                   n_bases=len(bases), wide=wide,
+                                   merged=[[st, sv, 1e3 * de] for st, sv, de in sr.merged])
+            if reason == "start":  # 2a: every converged start candidate in the window, before the dedupe
+                search_frames = sr.window_frames
             if sr.pending:  # unconverged inside the window: unknown, not absent (spec 2026-10-05 §5.3)
                 events.append(("pending", None))
-                pending = sr.pending
+                pending, new_pending = sr.pending, sr.pending_frames
             if not sr.states:
                 events.append(("search_empty", None))
             cands += [(f, None) for f in sr.states]
+            if p.densify_random and low is not None and step <= self._densify_until:
+                # design memo 2026-10-23 1a: the lowest t2g orientation after a symmetric start cannot be built, and
+                # about 1 in 9 random orientations reaches it (state.md §4.21, §4.23): sample it on the window steps
+                rtasks = random_orientation_tasks(mol, low.frame, self.metal_atoms, p.densify_random,
+                                                  np.random.default_rng(step), point_charges=point_charges)
+                rres = ledger.map(rtasks)
+                cands += [(r.frame, None) for r in rres if r.converged]
+                trace["search"]["random"] = dict(n=len(rtasks), converged=sum(r.converged for r in rres))
         if active and self.scheduler.due(step):
             base = min(active, key=lambda m: m.result.energy).frame
             refreshed = refresh(ledger, mol, base, d_occupation_patterns(base, self.metal_atoms)[1:],
@@ -281,7 +359,8 @@ class BeamEngine:
                                 screen_cycles=p.screen_cycles, screen_window=p.screen_window,
                                 same_state_sv=tol.same_state_sv, point_charges=point_charges)
             cands += [(f, None) for f in refreshed.siblings]
-            trace["refresh"] = dict(log=list(refreshed.log), unknown=refreshed.unknown)
+            trace["refresh"] = dict(log=list(refreshed.log), unknown=refreshed.unknown,
+                                    merged=[[sv, 1e3 * de] for sv, de in refreshed.merged])
         revivable = [m for m in self.members if m.status is LineageStatus.DORMANT and m.seed is not None
                      and revive_eligible(m.lost_step, step, p.revive_steps)]
         rtasks = [SCFTask(mol=mol, dm0=m.engine.extrapolator.guess((m.seed,), mol), imom_ref=m.seed,
@@ -289,6 +368,23 @@ class BeamEngine:
         for m, r in zip(revivable, ledger.map(rtasks)):
             if r.converged:
                 cands.append((r.frame, m.id))
+        # Earlier searches' pending candidates (design 2026-10-11 §5.2): continue each for up to revive_steps steps
+        # from its last frame (IMOM on it, cap_near, no fallback). Converged -> a candidate like any other; one that
+        # is already an ACTIVE lineage is resolved without an SCF; still unconverged when it expires -> unknown.
+        live = [c for c in self._pending if step - c.born <= p.revive_steps]
+        expired = len(self._pending) - len(live)
+        known = [c for c in live if any(self._same(m.frame, c.frame, "pending_known") for m in active)]
+        carried = [c for c in live if c not in known]
+        ctasks = [SCFTask(mol=mol, dm0=GrassmannGuess().guess((c.frame,), mol), imom_ref=c.frame, max_cycle=p.cap_near,
+                          point_charges=point_charges, tag="pending") for c in carried]
+        still: list[_Carry] = []
+        for c, r in zip(carried, ledger.map(ctasks)):
+            if r.converged:
+                cands.append((r.frame, None))
+            else:
+                still.append(_Carry(r.frame, c.born))
+        trace["pending"] = dict(carried=len(carried), known=len(known), converged=len(carried) - len(still),
+                                expired=expired)
 
         # 3. admission, lowest first (spec §4.4-4.5, §5.4). Batches of up to max_lineages candidates; a failed
         #    admission does not use up a slot, so the candidates behind it get their chance in the next batch.
@@ -297,7 +393,8 @@ class BeamEngine:
         for f, rid in sorted(cands, key=lambda c: c[0].energy):
             if f.energy - emin > p.keep_window:
                 break
-            if any(tol.same_state(m.frame, f) for m in active) or any(tol.same_state(q, f) for q, _ in queue):
+            if any(self._same(m.frame, f, "cand_known") for m in active) or \
+                    any(self._same(q, f, "cand_queue") for q, _ in queue):
                 continue
             queue.append((f, rid))
         forced = None
@@ -307,7 +404,7 @@ class BeamEngine:
             batch: list[tuple[Frame, int | None]] = []
             while queue and len(batch) < p.max_lineages:
                 f, rid = queue.popleft()
-                if any(tol.same_state(m.frame, f) for m in live):  # admitted from an earlier batch
+                if any(self._same(m.frame, f, "cand_known") for m in live):  # admitted from an earlier batch
                     continue
                 if admission_slot(f.energy - tol.admit_de, energies, p.max_lineages, self._protected())[0] == "full":
                     events.append(("full", None))  # no slot even at the lowest energy admission may return
@@ -321,10 +418,10 @@ class BeamEngine:
                 r = e.finish(task, res)
                 if res.converged and (forced is None or r.energy < forced[1].energy):
                     forced = (e, r, rid, res)
-                stable = tol.same_state(f, e.lineage.last_frame) and abs(r.energy - f.energy) < tol.admit_de
+                stable = self._same(f, e.lineage.last_frame, "admit") and abs(r.energy - f.energy) < tol.admit_de
                 if not (res.converged and stable):
                     events.append(("unstable", None))
-                elif any(tol.same_state(m.frame, e.lineage.last_frame) for m in self._active()):
+                elif any(self._same(m.frame, e.lineage.last_frame, "duplicate") for m in self._active()):
                     events.append(("duplicate", None))  # re-converged onto a lineage, e.g. one admitted this batch
                 else:
                     self._admit(e, r, rid, events, scf_result=res)
@@ -336,7 +433,7 @@ class BeamEngine:
         # 4. merge lineages on one state, keep the lower (spec §4.5)
         kept: list[_Member] = []
         for m in sorted(self._active(), key=lambda m: m.result.energy):
-            if any(tol.same_state(k.frame, m.frame) for k in kept):
+            if any(self._same(k.frame, m.frame, "merge") for k in kept):
                 m.status = LineageStatus.PRUNED
                 events.append(("merge", m.id))
             else:
@@ -407,7 +504,18 @@ class BeamEngine:
             m.gap_last, m.seed = m.result.energy - emin, m.frame
         energies = sorted(m.result.energy for m in active)
         gap = energies[1] - energies[0] if len(energies) > 1 else np.inf
-        unknown = (refreshed.unknown if refreshed is not None else 0) + pending
+        # this search's pending candidates are carried, not yet unknown: only those already an ACTIVE lineage or
+        # already carried are dropped
+        fresh: list[Frame] = []
+        for f in new_pending:
+            if not any(self._same(g, f, "pending_new") for g in [m.frame for m in active] + [c.frame for c in still] + fresh):
+                fresh.append(f)
+        self._pending = still + [_Carry(f, step) for f in fresh]
+        trace["pending"]["alive"] = len(self._pending)
+        # Unknown = a refresh candidate left unconverged, or a pending candidate that expired unresolved. A search's
+        # own pending no longer counts: it is being continued, and counting it let every densified search extend
+        # the window again (R1 2026-10-22, state.md §4.18: wide searches on every step 1-9).
+        unknown = (refreshed.unknown if refreshed is not None else 0) + expired
         if reason is not None:
             self._unknown_streak = 1 if unknown else 0
         elif refreshed is not None:
@@ -427,9 +535,10 @@ class BeamEngine:
             else:  # resolved, or the next periodic search takes over (no periodic search: no unbounded extension)
                 trace["densify"] = dict(event="end", until=step, unresolved=unresolved)
         beam_changed = any(kind in _CHANGES for kind, _ in events)
+        open_unknown = pending + len(self._pending) + expired  # an unknown still pulls the next refresh (spec 10-05)
         if refreshed is not None:
-            self.scheduler.record(step, gap, refreshed.unknown + pending, status == "DEGENERATE", beam_changed)
-        elif beam_changed or pending:
+            self.scheduler.record(step, gap, refreshed.unknown + open_unknown, status == "DEGENERATE", beam_changed)
+        elif beam_changed or open_unknown:
             self.scheduler.poke(step)
         self._gap_prev = gap
 
@@ -450,6 +559,7 @@ class BeamEngine:
             trace=trace,
             frames={m.id: m.frame for m in active},
             energy_final=energy_final,
+            search_frames=search_frames,
         )
         self.step += 1
         return out

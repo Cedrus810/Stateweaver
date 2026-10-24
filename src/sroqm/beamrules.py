@@ -27,6 +27,7 @@ class BeamParams:
     densify_steps: int = 0                 # full search on each of the next n steps after a DEGENERATE start
     escalate_unknown: int | None = None    # n discovery steps in a row with unknowns -> full search next step
     screen_margin: float | None = None     # Hartree; screen search candidates (search design 2026-10-11 §5.1)
+    densify_random: int = 0                # random t2g-orientation SCFs on each densify-window step (memo 10-23 1a)
 
     def __post_init__(self):
         if self.max_lineages < 1 or self.n_prune < 1:
@@ -43,8 +44,8 @@ class BeamParams:
             raise ValueError("search_every must be >= 1 or None")
         if self.screen_cycles < 1 or self.max_interval < 1 or self.grad_reseat_cycles < 1:
             raise ValueError("screen_cycles, max_interval and grad_reseat_cycles must be >= 1")
-        if self.densify_steps < 0:
-            raise ValueError("densify_steps must be >= 0")
+        if self.densify_steps < 0 or self.densify_random < 0:
+            raise ValueError("densify_steps and densify_random must be >= 0")
         if self.escalate_unknown is not None and self.escalate_unknown < 1:
             raise ValueError("escalate_unknown must be >= 1 or None")
         if self.screen_margin is not None and self.screen_margin < 0:

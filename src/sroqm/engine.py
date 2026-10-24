@@ -10,7 +10,7 @@ from sroqm.alarms import Alarm, AlarmThresholds, evaluate_alarms
 from sroqm.backend import PySCFBackend
 from sroqm.executor import SCFTask, TaskResult, run_task
 from sroqm.extrapolate import Extrapolator, GrassmannGuess
-from sroqm.fingerprint import compare, compute_fingerprint, frontier_gaps
+from sroqm.fingerprint import compare, frontier_gaps
 from sroqm.frame import Frame
 from sroqm.lineage import Lineage
 from sroqm.overlap import occupied_overlap
@@ -113,7 +113,7 @@ class Engine:
         history = self._history()
         out, mol = result.outcome, task.mol
         frame = result.frame
-        fp = compute_fingerprint(out.mf, self.fragments)
+        fp = result.fingerprint(self.fragments)  # on the worker that keeps the SCF, if any
         prev_fp = self.lineage.last_fingerprint
         self._last_context = (history[0] if history else None, prev_fp, self.lineage.last_gaps)
         change = compare(prev_fp, fp) if prev_fp is not None else None
@@ -154,7 +154,7 @@ class Engine:
             raise ValueError("gradient result must replace this lineage's current step")
         forces = self.forces_from(result)
         frame = result.frame
-        fp = compute_fingerprint(result.outcome.mf, self.fragments)
+        fp = result.fingerprint(self.fragments)
         prev_frame, prev_fp, prev_gaps = self._last_context
         change = compare(prev_fp, fp) if prev_fp is not None else None
         overlap = occupied_overlap(prev_frame, frame) if prev_frame is not None else None

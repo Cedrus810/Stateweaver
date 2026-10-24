@@ -58,6 +58,29 @@ def _channel_combinations(channels, distances, index=0, prefix=()):
         yield from _channel_combinations(channels, distances, index + 1, prefix + (combo,))
 
 
+def _d_channels(base: Frame, metal_atoms, min_pop: float, window: int):
+    """Per spin channel, (d-dominated MO indices within `window` of the HOMO, the occupied ones among them);
+    None without metal d AOs or electrons."""
+    mol = base.mol
+    rows = _metal_d_rows(mol, metal_atoms)
+    coeffs = base.mo_coeff if base.unrestricted else base.mo_coeff[None]
+    occs = base.mo_occ if base.unrestricted else base.mo_occ[None]
+    if not rows or not np.any(occs > 0):
+        return None
+    orth_s = lo.orth_ao(mol, "meta_lowdin").T @ base.ovlp
+    channels = []
+    for C, occ in zip(coeffs, occs):
+        occupied = np.flatnonzero(occ > 0)
+        if occupied.size == 0:
+            channels.append(([], []))
+            continue
+        pop = ((orth_s @ C)[rows] ** 2).sum(axis=0)
+        homo = occupied[-1]
+        dset = [i for i in range(max(0, homo - window), min(len(occ), homo + window + 1)) if pop[i] > min_pop]
+        channels.append((dset, [i for i in dset if occ[i] > 0]))
+    return channels
+
+
 def d_occupation_patterns(base: Frame, metal_atoms, min_pop: float = 0.5, window: int = 15,
                           max_candidates: int = 24) -> list[np.ndarray]:
     """Occupation arrays that redistribute each channel's metal-d electrons among its d-dominated MOs.
@@ -71,26 +94,11 @@ def d_occupation_patterns(base: Frame, metal_atoms, min_pop: float = 0.5, window
         raise ValueError("max_candidates must be >= 0")
     if max_candidates == 0:
         return []
-    mol = base.mol
-    rows = _metal_d_rows(mol, metal_atoms)
     unrestricted = base.unrestricted
-    coeffs = base.mo_coeff if unrestricted else base.mo_coeff[None]
     occs = base.mo_occ if unrestricted else base.mo_occ[None]
-    if not rows or not np.any(occs > 0):
+    channels = _d_channels(base, metal_atoms, min_pop, window)
+    if channels is None:
         return [base.mo_occ.copy()]
-    orth_s = lo.orth_ao(mol, "meta_lowdin").T @ base.ovlp
-
-    channels = []
-    for C, occ in zip(coeffs, occs):
-        occupied = np.flatnonzero(occ > 0)
-        if occupied.size == 0:
-            channels.append(([], []))
-            continue
-        pop = ((orth_s @ C)[rows] ** 2).sum(axis=0)
-        homo = occupied[-1]
-        dset = [i for i in range(max(0, homo - window), min(len(occ), homo + window + 1)) if pop[i] > min_pop]
-        filled = [i for i in dset if occ[i] > 0]
-        channels.append((dset, filled))
 
     limits = [min(len(filled), len(dset) - len(filled)) for dset, filled in channels]
     out = []
@@ -109,11 +117,17 @@ def d_occupation_patterns(base: Frame, metal_atoms, min_pop: float = 0.5, window
     return out
 
 
-def _dedupe(frames: list[Frame], same_state_sv: float) -> list[Frame]:
+def _dedupe(frames: list[Frame], same_state_sv: float, merged: list | None = None, stage: str = "") -> list[Frame]:
+    """Distinct frames, lowest first. `merged` collects (stage, sigma_min, E_dropped - E_kept) of every frame dropped as
+    the same state as a kept one (design memo 2026-10-23 §2.2 2a: is sigma >= 0.9 too loose near B?)."""
     kept: list[Frame] = []
     for f in sorted(frames, key=lambda f: f.energy):
-        if all(occupied_overlap(k, f).min_sv < same_state_sv for k in kept):
+        svs = [occupied_overlap(k, f).min_sv for k in kept]
+        if all(sv < same_state_sv for sv in svs):
             kept.append(f)
+        elif merged is not None:
+            i = int(np.argmax(svs))
+            merged.append((stage, svs[i], f.energy - kept[i].energy))
     return kept
 
 
@@ -152,6 +166,9 @@ class SearchResult:
     pending: int = 0        # unconverged enumerations within keep_window of the lowest: unknown, not absent
     screened: int = 0       # candidates the short-segment screen dropped
     screened_de: tuple = () # (task tag, E_k - anchor in Ha) of each dropped candidate, in drop order
+    pending_frames: tuple = ()  # the pending candidates' last (unconverged) frames, to continue later (design §5.2)
+    merged: tuple = ()      # (stage, sigma_min, dE in Ha) of every candidate the dedupe dropped as a duplicate
+    window_frames: tuple = ()  # every converged candidate within keep_window of the lowest, before the dedupe
 
 
 def enumeration_tasks(mol, base: Frame, metal_atoms, include_own: bool, max_cycle=None, point_charges=None,
@@ -163,6 +180,48 @@ def enumeration_tasks(mol, base: Frame, metal_atoms, include_own: bool, max_cycl
     guesses = [base.with_occupations(occ) for occ in (patterns if include_own else patterns[1:])]
     return [SCFTask(mol=mol, dm0=g.dm, imom_ref=g, max_cycle=max_cycle, point_charges=point_charges, tag=tag)
             for g in guesses]
+
+
+def orientation_blocks(base: Frame, metal_atoms, size: int = 3, min_pop: float = 0.5, window: int = 15) -> list:
+    """Per spin channel, the MOs whose orientation random_orientation_tasks rotates: the channel's occupied metal-d MOs
+    plus its lowest virtual metal-d MOs, `size` in all (MO order = orbital-energy order of canonical orbitals); []
+    for a channel with no occupied d MO or at least `size` of them. size = 3 is the t2g block of the minority channel
+    of high-spin octahedral d6, the only case calibrated (state.md §4.21, §4.23)."""
+    channels = _d_channels(base, metal_atoms, min_pop, window)
+    if channels is None:
+        return []
+    blocks = []
+    for dset, filled in channels:
+        empty = [i for i in dset if i not in filled]
+        ok = 0 < len(filled) < size and len(filled) + len(empty) >= size
+        blocks.append(sorted(filled + empty[:size - len(filled)]) if ok else [])
+    return blocks
+
+
+def random_orientation_tasks(mol, base: Frame, metal_atoms, n: int, rng, point_charges=None, size: int = 3,
+                             tag: str = "random") -> list[SCFTask]:
+    """n IMOM SCFs from `base` with each orientation block (orientation_blocks) turned by an independent Haar-random
+    rotation: the occupied d electron(s) of the block land in a random direction of the block's subspace.
+
+    After a symmetric DEGENERATE start the lowest t2g orientation cannot be constructed (E4, state.md §4.21); about 1
+    in 9 random orientations reaches it (E5, §4.23). Design memo docs/2026-10-23-phase3b-open-design-questions.zh-CN.md
+    option 1a."""
+    if base.mol is not mol:
+        base = Frame.from_orbitals(mol, base.mo_coeff, base.mo_occ)
+    blocks = orientation_blocks(base, metal_atoms, size)
+    if not any(blocks):
+        return []
+    tasks = []
+    for _ in range(n):
+        C = np.array(base.mo_coeff, copy=True)
+        chans = C if base.unrestricted else C[None]
+        for s, blk in enumerate(blocks):
+            if blk:
+                q, r = np.linalg.qr(rng.standard_normal((len(blk), len(blk))))
+                chans[s][:, blk] = chans[s][:, blk] @ (q * np.sign(np.diag(r)))
+        g = Frame.from_orbitals(mol, C, base.mo_occ)
+        tasks.append(SCFTask(mol=mol, dm0=g.dm, imom_ref=g, point_charges=point_charges, tag=tag))
+    return tasks
 
 
 def _lowest(anchor, results):
@@ -198,7 +257,7 @@ def _screened(executor, tasks, anchor, keep_window, screen):
 
 def _pending(results, keep, lowest, keep_window):
     """Kept, unconverged candidates within keep_window of the lowest state: unknown, not absent (spec 10-05 §5.3)."""
-    return sum(k and not r.converged and r.outcome.energy - lowest <= keep_window for r, k in zip(results, keep))
+    return [r for r, k in zip(results, keep) if k and not r.converged and r.outcome.energy - lowest <= keep_window]
 
 
 def full_search(executor, mol, bases, metal_atoms, keep_window, tol, point_charges=None, retry_guesses=False,
@@ -222,6 +281,7 @@ def full_search(executor, mol, bases, metal_atoms, keep_window, tol, point_charg
     converged state is known). Scratch SCFs are never screened.
     """
     enum, dropped, dropped_de = [], 0, []  # every enumeration result with whether the screen kept it
+    merged, converged = [], []             # dedupe records; every converged candidate frame
 
     def run(tasks, anchor_now):
         nonlocal dropped
@@ -242,8 +302,9 @@ def full_search(executor, mol, bases, metal_atoms, keep_window, tol, point_charg
                       for t in enumeration_tasks(mol, s.frame, metal_atoms, True, point_charges=point_charges,
                                                  tag="l1:scratch")], _lowest(anchor, out))
         tried = list(guesses)
+        converged += [s.frame for s in scratches if s.converged] + [r.frame for r in found if r.converged]
         level1 = _dedupe([s.frame for s in scratches if s.converged] + [r.frame for r in found if r.converged],
-                         tol.same_state_sv)
+                         tol.same_state_sv, merged, "level1")
         guesses = ()  # level 1 is done; skip the sequential loop below
     else:
         tried, level1 = [], []
@@ -259,17 +320,24 @@ def full_search(executor, mol, bases, metal_atoms, keep_window, tol, point_charg
             (scratch,) = executor.map([scratch_task])
             found = run(enumeration_tasks(mol, scratch.frame, metal_atoms, True, point_charges=point_charges,
                                           tag="l1:scratch"), _lowest(anchor, [scratch]))
+        converged += ([scratch.frame] if scratch.converged else []) + [r.frame for r in found if r.converged]
         level1 = _dedupe(([scratch.frame] if scratch.converged else []) + [r.frame for r in found if r.converged],
-                         tol.same_state_sv)
+                         tol.same_state_sv, merged, "level1")
         if level1 or not retry_guesses:
             break
     if not level1:
-        return SearchResult([], 0, 0, tuple(tried), (), screened=dropped, screened_de=tuple(dropped_de))
+        # Nothing converged. Candidates within keep_window of a known energy (the anchor) are still unknown, not
+        # absent: count them and hand them on to be continued (design 2026-10-11 §5.2; review 2026-10-23 #2).
+        pending = [] if anchor is None else _pending([r for r, _ in enum], [k for _, k in enum], anchor, keep_window)
+        return SearchResult([], 0, 0, tuple(tried), (), len(pending), dropped, tuple(dropped_de),
+                            tuple(r.frame for r in pending), tuple(merged))
     seeds = [f for f in level1 if f.energy - level1[0].energy <= keep_window]
     found2 = run([t for f in seeds
                   for t in enumeration_tasks(mol, f, metal_atoms, False, point_charges=point_charges, tag="l2")],
                  min(e for e in (anchor, level1[0].energy) if e is not None))
-    states = _dedupe(level1 + [r.frame for r in found2 if r.converged], tol.same_state_sv)
+    converged += [r.frame for r in found2 if r.converged]
+    states = _dedupe(level1 + [r.frame for r in found2 if r.converged], tol.same_state_sv, merged, "level2")
     pending = _pending([r for r, _ in enum], [k for _, k in enum], states[0].energy, keep_window)  # spec 10-05 §5.3
-    return SearchResult(states, len(level1), len(states) - len(level1), tuple(tried), tuple(seeds), pending, dropped,
-                        tuple(dropped_de))
+    window = tuple(sorted((f for f in converged if f.energy - states[0].energy <= keep_window), key=lambda f: f.energy))
+    return SearchResult(states, len(level1), len(states) - len(level1), tuple(tried), tuple(seeds), len(pending),
+                        dropped, tuple(dropped_de), tuple(r.frame for r in pending), tuple(merged), window)

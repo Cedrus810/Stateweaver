@@ -14,6 +14,7 @@ class RefreshResult:
     siblings: list          # converged Frames distinct from the base and each other, lowest first
     unknown: int            # still unconverged after stage 2: "unknown", not "absent"
     log: tuple              # "x+37" screened (mHa), "nc" unknown, "+0.123" sibling (mHa above base)
+    merged: tuple = ()      # (sigma_min, dE in Ha) of every converged candidate dropped as the base / a sibling
 
 
 def refresh(executor, mol, base: Frame, patterns, cap: int, screen_cycles: int = 4, screen_window: float = 5e-3,
@@ -40,13 +41,17 @@ def refresh(executor, mol, base: Frame, patterns, cap: int, screen_cycles: int =
         else:
             unknown += 1
             log.append("nc")
-    siblings = []
+    siblings, merged = [], []
     for f in sorted(done, key=lambda f: f.energy):
-        if occupied_overlap(base, f).min_sv < same_state_sv and \
-                all(occupied_overlap(s, f).min_sv < same_state_sv for s in siblings):
+        known = [base] + siblings
+        svs = [occupied_overlap(k, f).min_sv for k in known]
+        if all(sv < same_state_sv for sv in svs):
             siblings.append(f)
+        else:  # design memo 2026-10-23 §2.2 2a: record what sigma >= same_state_sv merged
+            i = max(range(len(svs)), key=svs.__getitem__)
+            merged.append((svs[i], f.energy - known[i].energy))
     log += [f"{1e3 * (f.energy - base.energy):+.3f}" for f in siblings]
-    return RefreshResult(siblings, unknown, tuple(log))
+    return RefreshResult(siblings, unknown, tuple(log), tuple(merged))
 
 
 class RefreshScheduler:
