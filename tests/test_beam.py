@@ -10,7 +10,7 @@ from sroqm.backend import MethodSpec, PySCFBackend
 from sroqm.beam import BeamEngine, _Member
 from sroqm.beamrules import BeamParams
 from sroqm.engine import Engine
-from sroqm.executor import SerialExecutor
+from sroqm.executor import SCFTask, SerialExecutor
 from sroqm.frame import Frame
 from sroqm.lineage import LineageStatus
 from sroqm.schedule import RefreshResult
@@ -543,7 +543,7 @@ def test_trace_records_budgets_search_and_refresh(water, ground, excited_water, 
     assert adv[first.lineage_id]["max_cycle"] is None  # the selected lineage: full budget
     other = next(i for i in adv if i != first.lineage_id)
     assert adv[other]["max_cycle"] == BeamParams().cap and adv[other]["converged"] is True
-    assert res.trace["search"] is None and res.trace["refresh"] == dict(log=[], unknown=0)
+    assert res.trace["search"] is None and res.trace["refresh"] == dict(log=[], unknown=0, merged=[])
 
 
 def test_a_search_with_pending_candidates_says_so(water, ground, monkeypatch):
@@ -754,3 +754,155 @@ def test_search_gets_the_lowest_lineage_as_anchor_and_the_screen(water, ground, 
     assert disc.search_calls[0]["anchor"] is None and disc.search_calls[0]["screen"] == (4, 5e-3)
     assert disc.search_calls[1]["anchor"] == pytest.approx(second.energy, abs=1e-8)
     assert beam(water).params.screen_margin is None
+
+
+def pending_search(states, frames, monkeypatch, calls=None):
+    """full_search returning `states` once, then nothing; every call leaves `frames` pending (re-read at mol)."""
+    left = [list(states)]
+
+    def search(executor, mol, bases, metal_atoms, keep_window, tol, **kw):
+        if calls is not None:
+            calls.append(kw)
+        found = left.pop(0) if left else []
+        return SearchResult([at(mol, f) for f in found], len(found), 0, ("minao",), (), pending=len(frames),
+                            pending_frames=tuple(at(mol, f) for f in frames))
+
+    monkeypatch.setattr("sroqm.beam.full_search", search)
+
+
+def test_a_searchs_own_pending_does_not_extend_the_densify_window(water, ground, excited_water, monkeypatch):
+    # R1 2026-10-22 (state.md §4.18): every densified search left candidates pending, so the window extended to
+    # step 9 and every step ran a wide search. The search's own pending is continued instead (design §5.2).
+    pending_search([ground, excited_water], [ground], monkeypatch)
+    monkeypatch.setattr("sroqm.beam.refresh", lambda *a, **kw: RefreshResult([], 0, ()))
+    b = beam(water, tol=DEG, densify_steps=1, search_every=4)
+    res = [b.compute(water.atom_coords()) for _ in range(5)]
+    assert [r.trace["search"] and r.trace["search"]["reason"] for r in res] == ["start", "densify", None, None,
+                                                                               "periodic"]
+    assert ("pending", None) in res[1].events
+    assert res[1].trace["densify"] == dict(event="end", until=1, unresolved=False)
+
+
+def test_a_pending_candidate_is_continued_and_admitted_when_it_converges(water, ground, excited_water, monkeypatch):
+    pending_search([ground], [excited_water], monkeypatch)
+    b = beam(water)
+    first = b.compute(water.atom_coords())
+    assert list(first.lineage_energies) == [first.lineage_id] and first.trace["pending"]["alive"] == 1
+    monkeypatch.setattr("sroqm.beam.full_search", None)  # no search on step 1
+    second = b.compute(water.atom_coords())
+    assert [t["tag"] for t in second.trace["tasks"]].count("pending") == 1
+    assert second.trace["pending"] == dict(carried=1, known=0, converged=1, expired=0, alive=0)
+    assert ("spawn", 1) in second.events and len(second.lineage_energies) == 2
+    assert second.lineage_energies[1] == pytest.approx(excited_water.energy, abs=1e-6)
+
+
+def test_a_pending_candidate_on_an_active_lineage_is_not_continued(water, ground, excited_water, monkeypatch):
+    pending_search([ground, excited_water], [ground], monkeypatch)
+    b = beam(water)
+    assert b.compute(water.atom_coords()).trace["pending"]["alive"] == 0  # it is the ground lineage
+    monkeypatch.setattr("sroqm.beam.full_search", None)
+    second = b.compute(water.atom_coords())
+    assert "pending" not in [t["tag"] for t in second.trace["tasks"]] and second.trace["pending"]["carried"] == 0
+
+
+class PendingNeverConverges(SerialExecutor):
+    def map(self, tasks):
+        out = super().map(tasks)
+        return [unconverged(r) if t.tag == "pending" else r for t, r in zip(tasks, out)]
+
+
+def test_a_pending_candidate_that_expires_unresolved_is_unknown(water, ground, excited_water, monkeypatch):
+    pending_search([ground], [excited_water], monkeypatch)
+    monkeypatch.setattr("sroqm.beam.refresh", lambda *a, **kw: RefreshResult([], 0, ()))
+    b = beam(water, executor=PendingNeverConverges(uks()), revive_steps=1, escalate_unknown=1)
+    res = [b.compute(water.atom_coords())]
+    monkeypatch.setattr("sroqm.beam.full_search", None)
+    res += [b.compute(water.atom_coords()) for _ in range(2)]
+    assert res[1].trace["pending"] == dict(carried=1, known=0, converged=0, expired=0, alive=1)
+    assert ("escalate", None) not in res[1].events                 # still being continued: not unknown yet
+    assert res[2].trace["pending"] == dict(carried=0, known=0, converged=0, expired=1, alive=0)
+    assert ("escalate", None) in res[2].events                     # expired unresolved: unknown
+
+
+def test_a_beam_on_the_process_executor_matches_the_serial_beam(water, ground, excited_water, water_step,
+                                                                 monkeypatch):
+    from sroqm.executor import ProcessExecutor
+    coords = [water.atom_coords() + k * water_step for k in range(3)]
+    Discovery(monkeypatch, search=[[ground, excited_water]])
+    serial = [r for b in [beam(water)] for r in (b.compute(x) for x in coords)]
+    Discovery(monkeypatch, search=[[ground, excited_water]])
+    with ProcessExecutor(uks().spec, n_workers=2, threads=1, pin=False) as ex:
+        b = beam(water, executor=ex)
+        par = [b.compute(x) for x in coords]
+        assert ex._generation == 3  # every step released its workers' SCF objects
+    for s, p in zip(serial, par):
+        assert p.lineage_id == s.lineage_id and kinds(p) == kinds(s)
+        assert p.lineage_energies == pytest.approx(s.lineage_energies, abs=1e-7)
+        np.testing.assert_allclose(p.forces, s.forces, atol=1e-6)  # computed on the worker that kept the SCF
+
+
+def test_same_state_judgments_are_recorded_with_sigma_and_energy(water, ground, excited_water, monkeypatch):
+    # design memo 2026-10-23 2a: decisions unchanged, every pair called one state is in the trace
+    twin = dataclasses.replace(ground, energy=ground.energy + 2e-6)
+    Discovery(monkeypatch, search=[[ground, twin, excited_water]])
+    res = beam(water).compute(water.atom_coords())
+    where = [r["where"] for r in res.trace["same_state"]]
+    assert "cand_queue" in where and "admit" in where  # the twin is dropped from the queue; admissions re-converge
+    q = next(r for r in res.trace["same_state"] if r["where"] == "cand_queue")
+    assert q["sv"] > 0.999 and q["de_mha"] == pytest.approx(0.002, abs=1e-6)
+    assert kinds(res).count("spawn") == 2
+
+
+def test_the_start_search_candidates_come_back_for_saving(water, ground, excited_water, monkeypatch):
+    def search(executor, mol, bases, metal_atoms, keep_window, tol, **kw):
+        fs = [at(mol, ground), at(mol, excited_water)]
+        return SearchResult(fs, 2, 0, ("minao",), (), window_frames=tuple(fs))
+
+    monkeypatch.setattr("sroqm.beam.full_search", search)
+    b = beam(water, search_every=1)
+    assert len(b.compute(water.atom_coords()).search_frames) == 2
+    assert b.compute(water.atom_coords()).search_frames == ()  # only the start search
+
+
+def test_a_failed_step_leaves_the_beam_as_it_was(water, ground, excited_water, water_step, monkeypatch):
+    # review 2026-10-23 #3: the advance pushed every lineage's frame before discovery; a failure afterwards left the
+    # instance one frame ahead, so calling it again doubled the step
+    Discovery(monkeypatch, search=[[ground, excited_water]])
+    b = beam(water)
+    b.compute(water.atom_coords())
+    before = [(m.id, m.status, m.engine.step, len(m.engine.lineage.frames), len(m.engine.lineage.energies))
+              for m in b.members]
+    nxt = b.scheduler.next_step
+
+    def broken(*a, **kw):
+        raise RuntimeError("discovery failed")
+
+    monkeypatch.setattr("sroqm.beam.refresh", broken)
+    with pytest.raises(RuntimeError, match="discovery failed"):
+        b.compute(water.atom_coords() + water_step)
+    assert b.step == 1 and b.scheduler.next_step == nxt
+    assert [(m.id, m.status, m.engine.step, len(m.engine.lineage.frames), len(m.engine.lineage.energies))
+            for m in b.members] == before
+    monkeypatch.setattr("sroqm.beam.refresh", lambda *a, **kw: RefreshResult([], 0, ()))
+    res = b.compute(water.atom_coords() + water_step)  # the retry is an ordinary step 1
+    assert res.step == 1 and all(r.step == 1 for r in res.results.values())
+    assert all(len(m.engine.lineage.energies) == 2 for m in b.members if m.status is LineageStatus.ACTIVE)
+
+
+def test_random_orientations_are_sampled_only_inside_the_densify_window(water, ground, excited_water, monkeypatch):
+    # design memo 2026-10-23 1a; the real sampler needs a metal d shell (tests/test_search.py), here it is scripted
+    calls = []
+
+    def sampler(mol, base, metal_atoms, n, rng, point_charges=None):
+        calls.append(n)
+        g = at(mol, excited_water)
+        return [SCFTask(mol=mol, dm0=g.dm, imom_ref=g, tag="random")] * n
+
+    monkeypatch.setattr("sroqm.beam.random_orientation_tasks", sampler)
+    Discovery(monkeypatch, search=[[ground, excited_water]])
+    b = beam(water, tol=DEG, densify_steps=1, densify_random=2)
+    res = [b.compute(water.atom_coords()) for _ in range(3)]
+    assert calls == [2]  # step 1 only: step 0 is the start, step 2 is past the window
+    assert res[1].trace["search"]["random"] == dict(n=2, converged=2)
+    assert [t["tag"] for t in res[1].trace["tasks"]].count("random") == 2
+    assert "random" not in (res[0].trace["search"] or {})

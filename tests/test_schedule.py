@@ -52,6 +52,9 @@ def test_refresh_sorts_screens_and_counts_unknowns(water, outcomes):
     assert r.unknown == 1
     assert {t.max_cycle for t in ex.seen[0]} == {4} and [t.max_cycle for t in ex.seen[1]] == [30]
     assert "nc" in r.log and any(e.startswith("x+20") for e in r.log)
+    # design memo 2026-10-23 2a: the candidate that converged onto the base is recorded with its sigma and dE
+    (merged,) = r.merged
+    assert merged[0] > 0.999 and merged[1] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_refresh_without_patterns_runs_nothing(water, outcomes):

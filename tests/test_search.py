@@ -188,9 +188,11 @@ def test_unconverged_enumerations_inside_the_window_are_pending_not_absent(water
     ex = SerialExecutor(EnumerationNeverConverges(MethodSpec("rks/b3lyp")))
     res = full_search(ex, moved, [old], metal_atoms=[], keep_window=2e-3, tol=Tolerances(), merge_guesses=True)
     assert len(res.states) == 1 and res.pending == 4  # the base's enumeration + one per scratch, all NC
+    # their last frames come back too, at this geometry, so the beam can continue them (design 10-11 §5.2)
+    assert len(res.pending_frames) == 4 and all(f.mol is moved for f in res.pending_frames)
     clean = full_search(SerialExecutor(PySCFBackend(MethodSpec("rks/b3lyp"))), moved, [old], [], 2e-3, Tolerances(),
                         merge_guesses=True)
-    assert clean.pending == 0
+    assert clean.pending == 0 and clean.pending_frames == ()
 
 
 def test_search_tasks_are_tagged_by_source(water, water_step):
@@ -262,7 +264,7 @@ def test_dropped_candidates_are_not_pending(water):
                    "scratch": (-0.9, False), "near:s2": (-1.0, False)})
     out, keep = _screened(ex, _tasks(water), anchor=-1.0, keep_window=2e-3, screen=(4, 5e-3))
     from sroqm.search import _pending
-    assert _pending(out, keep, lowest=-0.9935, keep_window=2e-3) == 1  # "near" (NC, kept) only, not "far"
+    assert len(_pending(out, keep, lowest=-0.9935, keep_window=2e-3)) == 1  # "near" (NC, kept) only, not "far"
 
 
 class Inflating(SerialExecutor):
@@ -285,3 +287,72 @@ def test_full_search_drops_far_short_segments_and_does_not_count_them_pending(wa
     assert len(sr.screened_de) == sr.screened and all(de > 2e-3 + 5e-3 for _, de in sr.screened_de)
     assert all(isinstance(tag, str) and tag.startswith("l") for tag, _ in sr.screened_de)
     assert sr.states and abs(sr.states[0].energy - anchor) < 1e-6  # the unscreened scratch SCFs still find it
+
+
+class NothingConverges(PySCFBackend):
+    def run(self, mol, dm0=None, occ_hook=None, **kw):
+        return dataclasses.replace(super().run(mol, dm0=dm0, occ_hook=occ_hook, **kw), converged=False)
+
+
+def test_an_empty_search_still_hands_on_its_pending_candidates(water, water_step):
+    # review 2026-10-23 #2: with nothing converged the search returned early and dropped the in-window NC candidates,
+    # although the beam had a converged anchor at this geometry
+    moved = water.set_geom_(water.atom_coords() + water_step, unit="Bohr", inplace=False)
+    old = Frame.from_outcome(water, PySCFBackend(MethodSpec("rks/b3lyp")).run(water, with_gradient=False))
+    anchor = PySCFBackend(MethodSpec("rks/b3lyp")).run(moved, with_gradient=False).energy
+    ex = SerialExecutor(NothingConverges(MethodSpec("rks/b3lyp", max_cycle=50)))
+    res = full_search(ex, moved, [old], [], 2e-3, Tolerances(), merge_guesses=True, anchor=anchor)
+    assert res.states == [] and res.pending >= 1 and len(res.pending_frames) == res.pending
+    assert all(f.mol is moved for f in res.pending_frames)
+    blind = full_search(ex, moved, [old], [], 2e-3, Tolerances(), merge_guesses=True, anchor=None)
+    assert blind.pending == 0  # no known energy: no window to be "within"
+
+
+def test_the_search_records_what_its_dedupe_merged_and_keeps_the_window(water, water_step):
+    # design memo 2026-10-23 2a: every candidate dropped as a duplicate, with sigma and dE; every converged candidate
+    # within keep_window, before the dedupe
+    moved = water.set_geom_(water.atom_coords() + water_step, unit="Bohr", inplace=False)
+    old = Frame.from_outcome(water, PySCFBackend(MethodSpec("rks/b3lyp")).run(water, with_gradient=False))
+    res = full_search(SerialExecutor(PySCFBackend(MethodSpec("rks/b3lyp"))), moved, [old], [], 2e-3, Tolerances(),
+                      merge_guesses=True)
+    assert len(res.states) == 1 and res.merged  # three scratch guesses and the base all land on the ground state
+    assert all(stage in ("level1", "level2") and sv >= 0.9 and abs(de) < 1e-6 for stage, sv, de in res.merged)
+    assert len(res.window_frames) == len(res.merged) + 1 and res.states[0] in res.window_frames
+
+
+@pytest.fixture(scope="module")
+def fe_ion():
+    """A bare high-spin Fe2+ (d6) in STO-3G: a metal d shell with one minority-spin d electron, in seconds."""
+    from pyscf import gto
+    mol = gto.M(atom="Fe 0 0 0", charge=2, spin=4, basis="sto-3g", verbose=0)
+    return Frame.from_outcome(mol, PySCFBackend(MethodSpec("uhf")).run(mol, with_gradient=False))
+
+
+def test_orientation_blocks_take_the_minority_d_electron_and_its_two_lowest_empty_d(fe_ion):
+    from sroqm.search import orientation_blocks
+    alpha, beta = orientation_blocks(fe_ion, [0])
+    assert alpha == []  # five alpha d electrons: nothing to orient
+    occ = [i for i in beta if fe_ion.mo_occ[1][i] > 0]
+    assert len(beta) == 3 and len(occ) == 1 and occ[0] < min(i for i in beta if i not in occ)
+    assert orientation_blocks(fe_ion, []) == []
+
+
+def test_random_orientations_keep_the_electron_count_and_the_block_subspace(fe_ion):
+    from sroqm.search import orientation_blocks, random_orientation_tasks
+    blk = orientation_blocks(fe_ion, [0])[1]
+    tasks = random_orientation_tasks(fe_ion.mol, fe_ion, [0], 4, np.random.default_rng(0))
+    assert len(tasks) == 4 and all(t.tag == "random" and t.imom_ref is not None for t in tasks)
+    S = fe_ion.ovlp
+    p_block = fe_ion.mo_coeff[1][:, blk] @ fe_ion.mo_coeff[1][:, blk].T
+    hole_dirs = []
+    for t in tasks:
+        g = t.imom_ref
+        C = g.mo_coeff[1]
+        np.testing.assert_allclose(C.T @ S @ C, np.eye(C.shape[1]), atol=1e-8)  # still orthonormal
+        assert np.einsum("ij,ji->", g.dm[1], S) == pytest.approx(fe_ion.mol.nelec[1], abs=1e-8)
+        np.testing.assert_allclose(g.mo_coeff[0], fe_ion.mo_coeff[0])           # alpha untouched
+        d = C[:, [i for i in blk if g.mo_occ[1][i] > 0]][:, 0]
+        np.testing.assert_allclose(p_block @ S @ d, d, atol=1e-8)                # stays in the block's span
+        hole_dirs.append(d)
+    assert abs(hole_dirs[0] @ S @ hole_dirs[1]) < 0.999  # different directions
+    assert random_orientation_tasks(fe_ion.mol, fe_ion, [], 4, np.random.default_rng(0)) == []

@@ -63,6 +63,9 @@ def test_replay_and_cli_on_a_short_water_trajectory(tmp_path, water, water_step)
         assert lin["sv_ref"] > 0.999 and abs(lin["de_ref_mha"]) < 1e-3 and r["e_ref"] < 0
     assert json.loads(out.read_text())["params"]["densify_steps"] == 0
     assert all(r["peak_rss_mb"] > 0 and r["rss_mb"] > 0 for r in json.loads(out.read_text())["rows"])
+    # every step is also in the JSON-lines file written as the run goes (survives a stopped run)
+    streamed = [json.loads(line) for line in (tmp_path / "result.rows.jsonl").read_text().splitlines()]
+    assert streamed == json.loads(out.read_text())["rows"]
 
 
 def test_an_energy_verdict_above_the_noise_is_a_warning():
@@ -88,6 +91,23 @@ def test_cli_passes_the_discovery_switches_and_records_the_params(tmp_path, wate
     with pytest.raises(Stop):
         main(["--coords", str(tmp_path / "coords.npy"), "--prefix", "w", "--out", str(tmp_path / "r.json"),
               "--system", "water", "--basis", "6-31g", "--method", "rks/b3lyp", "--metal-atoms", "",
-              "--densify-steps", "4", "--escalate-unknown", "2", "--screen-margin-mha", "5"])
+              "--densify-steps", "4", "--escalate-unknown", "2", "--screen-margin-mha", "5", "--densify-random", "40"])
     p = seen["params"]
     assert (p.densify_steps, p.escalate_unknown, p.screen_margin) == (4, 2, pytest.approx(5e-3))
+    assert p.densify_random == 40
+
+
+def test_a_missed_or_warned_replay_exits_with_its_own_code(tmp_path, water, monkeypatch):
+    # review 2026-10-23 #4: 1 meant both "warned" and "crashed"; a finished replay that fails the gate now exits 3
+    import bench_beam
+    from bench_beam import StepVerdict
+    monkeypatch.setattr(bench_beam, "judge_step", lambda *a, **kw: StepVerdict(False, "miss", 0.1, 1.0))
+    coords = np.array([water.atom_coords()])
+    np.save(tmp_path / "coords.npy", coords)
+    be = rks()
+    f = Frame.from_outcome(water, be.run(water, with_gradient=False))
+    np.savez(tmp_path / "w_000.npz", energies=np.array([f.energy]), mo_coeff=f.mo_coeff, mo_occ=f.mo_occ, coords=coords[0])
+    code = main(["--coords", str(tmp_path / "coords.npy"), "--ref", str(tmp_path), "--prefix", "w",
+                 "--out", str(tmp_path / "r.json"), "--system", "water", "--basis", "6-31g", "--method", "rks/b3lyp",
+                 "--conv-tol", "1e-10", "--metal-atoms", ""])
+    assert code == bench_beam.GATE_FAILED == 3

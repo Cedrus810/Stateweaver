@@ -6,6 +6,9 @@ state (occupied sigma_min >= same_state_sv), else if it is within accept_de of t
 the beam flagged DEGENERATE and it is within deg_band (spec §3). An `energy` pass more than WARN_DE_MHA above the
 best known is reported as a warning and fails the run.
 
+Exit code: 0 every step passed without warning; 3 a miss or a warning (the run finished; see SUMMARY); anything else
+(1 for an uncaught exception) means the replay itself failed (review 2026-10-23 #4: 1 used to mean both).
+
 usage: python benchmarks/bench_beam.py --coords traj2_coords.npy --ref ~/sroqm/out/ref3 --prefix traj2 --out r.json
 
 Energy-only replay with an r2scan_jax backend (r2scan_jax spec 2026-10-11 §3.6; needs r2scan_jax/src and
@@ -28,6 +31,7 @@ import numpy as np
 from sroqm.backend import MethodSpec, PySCFBackend
 from sroqm.beam import BeamEngine
 from sroqm.beamrules import BeamParams
+from sroqm.executor import ProcessExecutor
 from sroqm.frame import Frame
 from sroqm.overlap import occupied_overlap
 from sroqm.testsystems import build
@@ -42,6 +46,7 @@ class StepVerdict:
     de_mha: float      # selected minus best known (min of selected and reference), mHa
 
 
+GATE_FAILED = 3     # exit code: the replay finished but missed or warned (1 is Python's code for an uncaught exception)
 WARN_DE_MHA = 0.02  # same-state convergence noise at conv_tol=1e-7 is <= 0.016 mHa (state.md §4.8)
 
 
@@ -94,16 +99,33 @@ def rss_mb() -> float:
     return float("nan")
 
 
-def replay(beam: BeamEngine, coords_list, ref_dir, prefix: str, tol: Tolerances, save_dir=None) -> list[dict]:
+def replay(beam: BeamEngine, coords_list, ref_dir, prefix: str, tol: Tolerances, save_dir=None,
+           rows_path=None) -> list[dict]:
+    """rows_path: also append every row to this JSON-lines file as soon as its step finishes, so a run that is
+    stopped or crashes keeps the trace of the steps it completed (R1 2026-10-22 lost all of it)."""
     rows = []
+    if rows_path is not None:
+        Path(rows_path).write_text("")
+
+    def emit(row):
+        rows.append(row)
+        if rows_path is not None:
+            with open(rows_path, "a") as fh:
+                fh.write(json.dumps(row) + "\n")
+
     for k, x in enumerate(coords_list):
         t = time.perf_counter()
         res = beam.compute(x)
         seconds = time.perf_counter() - t
         if save_dir is not None:
             save_frame(Path(save_dir) / f"{prefix}_{k:03d}.npz", res)
+            if res.search_frames:  # design memo 2026-10-23 §2.2 2a: the start search's converged candidates
+                fs = res.search_frames
+                np.savez(Path(save_dir) / f"{prefix}_{k:03d}_search.npz", coords=fs[0].mol.atom_coords(),
+                         energies=np.array([f.energy for f in fs]), mo_coeff=np.array([f.mo_coeff for f in fs]),
+                         mo_occ=np.array([f.mo_occ for f in fs]))
         if ref_dir is None:
-            rows.append(dict(step=k, energy=res.energy, energy_final=res.energy_final, status=res.status,
+            emit(dict(step=k, energy=res.energy, energy_final=res.energy_final, status=res.status,
                              events=[list(e) for e in res.events], manifold=[list(m) for m in res.manifold],
                              seconds=seconds, passed=True, warn=False, trace=res.trace,
                              peak_rss_mb=peak_rss_mb(), rss_mb=rss_mb()))
@@ -113,7 +135,7 @@ def replay(beam: BeamEngine, coords_list, ref_dir, prefix: str, tol: Tolerances,
             continue
         ref = load_reference(Path(ref_dir) / f"{prefix}_{k:03d}.npz", beam.template)
         v = judge_step(res.frame, res.status == "DEGENERATE", ref, tol)
-        rows.append(dict(step=k, energy=res.energy, status=res.status, events=[list(e) for e in res.events],
+        emit(dict(step=k, energy=res.energy, status=res.status, events=[list(e) for e in res.events],
                          manifold=[list(m) for m in res.manifold], seconds=seconds, peak_rss_mb=peak_rss_mb(), rss_mb=rss_mb(),
                          passed=v.passed,
                          reason=v.reason, sigma_min=v.sigma_min, de_mha=v.de_mha, warn=is_warn(v), trace=res.trace,
@@ -151,6 +173,12 @@ def main(argv=None) -> int:
                     help="n discovery steps in a row with unknowns -> full search (BeamParams.escalate_unknown)")
     ap.add_argument("--screen-margin-mha", type=float, default=None,
                     help="screen search candidates at keep_window + this many mHa (BeamParams.screen_margin)")
+    ap.add_argument("--densify-random", type=int, default=0,
+                    help="random t2g-orientation SCFs on each densify-window step (BeamParams.densify_random)")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="run the SCFs on this many worker processes (ProcessExecutor); 0: serial in this process")
+    ap.add_argument("--worker-threads", type=int, default=1,
+                    help="OpenMP threads per worker; workers are pinned to consecutive blocks of this process's CPUs")
     args = ap.parse_args(argv)
 
     tol = Tolerances(conv_tol=args.conv_tol)
@@ -171,17 +199,31 @@ def main(argv=None) -> int:
     metals = [int(i) for i in args.metal_atoms.split(",") if i.strip()]
     coords = np.load(args.coords)[: args.steps]
     params = BeamParams(densify_steps=args.densify_steps, escalate_unknown=args.escalate_unknown,
+                        densify_random=args.densify_random,
                         screen_margin=None if args.screen_margin_mha is None else 1e-3 * args.screen_margin_mha)
-    rows = replay(BeamEngine(mol, backend, metal_atoms=metals, tol=tol, energy_only=args.energy_only, params=params),
-                  coords, args.ref, args.prefix, tol, save_dir=args.save_frames)
+    executor = None
+    if args.workers:
+        if args.backend != "pyscf":
+            ap.error("--workers needs --backend pyscf")
+        executor = ProcessExecutor(backend.spec, args.workers, args.worker_threads)
+    try:
+        rows = replay(BeamEngine(mol, backend, metal_atoms=metals, tol=tol, energy_only=args.energy_only,
+                                 params=params, executor=executor),
+                      coords, args.ref, args.prefix, tol, save_dir=args.save_frames,
+                      rows_path=Path(args.out).with_suffix(".rows.jsonl"))
+    finally:
+        if executor is not None:
+            executor.close()
     t = np.array([r["seconds"] for r in rows])
     summary = dict(steps=len(rows), miss=sum(not r["passed"] for r in rows),
                    missed=[r["step"] for r in rows if not r["passed"]],
                    warn=sum(r["warn"] for r in rows), warned=[r["step"] for r in rows if r["warn"]],
                    mean_s=float(t.mean()), median_s=float(np.median(t)), max_s=float(t.max()))
-    Path(args.out).write_text(json.dumps(dict(params=dataclasses.asdict(params), summary=summary, rows=rows), indent=1))
+    run = dict(workers=args.workers, worker_threads=args.worker_threads if args.workers else None)
+    Path(args.out).write_text(json.dumps(dict(params=dataclasses.asdict(params), run=run, summary=summary, rows=rows),
+                                         indent=1))
     print(f"SUMMARY {summary}", flush=True)
-    return 1 if summary["miss"] or summary["warn"] else 0
+    return GATE_FAILED if summary["miss"] or summary["warn"] else 0
 
 
 if __name__ == "__main__":
