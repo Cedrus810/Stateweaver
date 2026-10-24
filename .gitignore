@@ -27,3 +27,9 @@ benchmarks/out/
 # Delete these two lines if you want them tracked.
 state.md
 docs/superpowers/
+
+# 本地工作文件
+/.commit_drafts/
+/researchd.plan.toml
+# SLURM 作业输出
+*.o[0-9]*
