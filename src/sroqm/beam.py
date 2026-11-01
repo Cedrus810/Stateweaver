@@ -88,6 +88,16 @@ class _Carry:
 
 
 @dataclass(frozen=True, eq=False)
+class _Shadow:
+    """A candidate merged into a kept state at sigma below shadow_sv: maybe another stationary point that has not
+    separated yet (R2 t2: B' and B at sigma 0.992, dE 0.003 mHa at step 0, 0.2 mHa apart at step 5). Followed for up
+    to shadow_steps steps until it merges for real or separates (design docs/2026-10-26-near-duplicate-shadow-...)."""
+    frame: Frame
+    born: int
+    id: int = -1             # stable id for the trace (review 2026-10-28 #2)
+
+
+@dataclass(frozen=True, eq=False)
 class BeamResult:
     step: int
     energy: float
@@ -137,6 +147,8 @@ class BeamEngine:
         self._unknown_streak = 0   # discovery steps in a row that left an unknown candidate
         self._pending: list[_Carry] = []  # search candidates being continued (design 2026-10-11 §5.2)
         self._same_log: list[dict] = []   # this step's same-state judgments (design memo 2026-10-23 §2.2 2a)
+        self._shadows: list[_Shadow] = []  # near duplicates being followed (design 2026-10-26)
+        self._next_shadow = 0
 
     # ---- helpers ---------------------------------------------------------------------------------------
     def _active(self) -> list[_Member]:
@@ -218,13 +230,22 @@ class BeamEngine:
             self._same_log.append(dict(where=where, sv=occupied_overlap(a, b).min_sv, de_mha=1e3 * (b.energy - a.energy)))
         return same
 
+    def _separated(self, a: _Member, b: _Member) -> bool:
+        """Two lineages that sigma >= same_state_sv calls one state but that have separated: sigma < shadow_sv and
+        |dE| > accept_de (shadows on only; design 2026-10-26, review 2026-10-28 #1)."""
+        p = self.params
+        if p.shadow_sv is None:
+            return False
+        return occupied_overlap(a.frame, b.frame).min_sv < p.shadow_sv and \
+            abs(a.result.energy - b.result.energy) > self.tol.accept_de
+
     def _advance_budget(self, m: _Member):
         b = advance_budget(m.id == self._selected, m.gap_last, self.params)
         return dataclasses.replace(b, with_gradient=False) if self.energy_only else b
 
     # ---- one step --------------------------------------------------------------------------------------
     _SCALARS = ("step", "_selected", "_followed", "_next_id", "_gap_prev", "_search_next", "_densify_until",
-                "_unknown_streak")
+                "_unknown_streak", "_next_shadow")
     _NOTHING = object()
 
     def _snapshot(self):
@@ -238,10 +259,10 @@ class BeamEngine:
         members = [(m, {f.name: getattr(m, f.name) for f in dataclasses.fields(m)}, engine(m.engine))
                    for m in self.members]
         return (members, {k: getattr(self, k) for k in self._SCALARS}, list(self._pending),
-                dict(vars(self.scheduler)))
+                dict(vars(self.scheduler)), list(self._shadows))
 
     def _restore(self, snap) -> None:
-        members, scalars, pending, scheduler = snap
+        members, scalars, pending, scheduler, shadows = snap
         for m, fields, (e, step, context, lid, birth, frames, fps, energies, gaps) in members:
             for k, v in fields.items():
                 setattr(m, k, v)
@@ -256,7 +277,7 @@ class BeamEngine:
         self.members = [m for m, _, _ in members]
         for k, v in scalars.items():
             setattr(self, k, v)
-        self._pending = pending
+        self._pending, self._shadows = pending, shadows
         self.scheduler.__dict__.clear()
         self.scheduler.__dict__.update(scheduler)
 
@@ -309,6 +330,9 @@ class BeamEngine:
         # 2. discovery (spec §5, §4.3)
         cands: list[tuple[Frame, int | None]] = []
         refreshed, pending, new_pending = None, 0, ()
+        near: list[tuple[Frame, Frame, float, str]] = []  # (kept, merged, sigma, where) to shadow (design 2026-10-26)
+        separated: dict[int, int] = {}                     # id(frame) -> shadow id, for shadows promoted this step
+        shadow_log: list[dict] = []                        # what happened to every shadow this step (review 10-28 #2)
         reason = search_reason(step, len(active), selected_lost, sel_alarms, p.search_every) or self._search_next
         if reason is None and step <= self._densify_until:
             reason = "densify"
@@ -329,7 +353,9 @@ class BeamEngine:
             sr = full_search(ledger, mol, bases, self.metal_atoms, p.keep_window, tol,
                              point_charges=point_charges, retry_guesses=not active, merge_guesses=True,
                              anchor=low.result.energy if low is not None else None,
-                             screen=(p.screen_cycles, p.screen_margin) if p.screen_margin is not None else None)
+                             screen=(p.screen_cycles, p.screen_margin) if p.screen_margin is not None else None,
+                             near_sv=p.shadow_sv)
+            near += [(k, f, sv, "search") for k, f, sv in sr.near_dups]
             events.append(("search", None))
             trace["search"] = dict(reason=reason, level1=sr.level1, level2=sr.level2, guesses=list(sr.guesses),
                                    n_states=len(sr.states), pending=sr.pending, screened=sr.screened,
@@ -385,6 +411,47 @@ class BeamEngine:
                 still.append(_Carry(r.frame, c.born))
         trace["pending"] = dict(carried=len(carried), known=len(known), converged=len(carried) - len(still),
                                 expired=expired)
+        # Shadows (design 2026-10-26): continue each from its last frame (IMOM on it, cap_near, no fallback) and compare
+        # with the ACTIVE lineages. No lineage at sigma >= same_state_sv -> an ordinary candidate; one at >= shadow_sv
+        # -> one state after all, dropped; otherwise separated once |dE| to every matching lineage > accept_de -> a
+        # candidate admitted even though sigma calls it one of them (the merge then keeps the lower); unconverged or
+        # older than shadow_steps -> dropped.
+        shadow_trace = dict(carried=0, same=0, separated=0, nc=0, expired=0)
+        still_shadows: list[_Shadow] = []
+        if p.shadow_sv is not None:
+            live_s = [h for h in self._shadows if step - h.born <= p.shadow_steps]
+            shadow_trace.update(carried=len(live_s), expired=len(self._shadows) - len(live_s))
+            stasks = [SCFTask(mol=mol, dm0=GrassmannGuess().guess((h.frame,), mol), imom_ref=h.frame,
+                              max_cycle=p.cap_near, point_charges=point_charges, tag="shadow") for h in live_s]
+            for h in self._shadows:
+                if step - h.born > p.shadow_steps:
+                    shadow_log.append(dict(id=h.id, event="expired"))
+            for h, r in zip(live_s, ledger.map(stasks)):
+                rec = dict(id=h.id, cycles=r.cycles, energy=r.outcome.energy)
+                if not r.converged:
+                    shadow_trace["nc"] += 1
+                    shadow_log.append(dict(rec, event="nc"))
+                    continue
+                y = r.frame
+                hits = [(m, occupied_overlap(m.frame, y).min_sv) for m in active]
+                rec["lineages"] = [[m.id, sv, 1e3 * (y.energy - m.result.energy)] for m, sv in hits]
+                hits = [(m, sv) for m, sv in hits if sv >= tol.same_state_sv]
+                if not hits:
+                    cands.append((y, None))
+                    separated[id(y)] = h.id
+                    shadow_trace["separated"] += 1
+                    shadow_log.append(dict(rec, event="distinct"))
+                elif max(sv for _, sv in hits) >= p.shadow_sv:
+                    shadow_trace["same"] += 1
+                    shadow_log.append(dict(rec, event="same"))
+                elif min(abs(y.energy - m.result.energy) for m, _ in hits) > tol.accept_de:
+                    cands.append((y, None))
+                    separated[id(y)] = h.id
+                    shadow_trace["separated"] += 1
+                    shadow_log.append(dict(rec, event="separated"))
+                else:
+                    still_shadows.append(_Shadow(y, h.born, h.id))
+                    shadow_log.append(dict(rec, event="followed"))
 
         # 3. admission, lowest first (spec §4.4-4.5, §5.4). Batches of up to max_lineages candidates; a failed
         #    admission does not use up a slot, so the candidates behind it get their chance in the next batch.
@@ -393,9 +460,14 @@ class BeamEngine:
         for f, rid in sorted(cands, key=lambda c: c[0].energy):
             if f.energy - emin > p.keep_window:
                 break
-            if any(self._same(m.frame, f, "cand_known") for m in active) or \
-                    any(self._same(q, f, "cand_queue") for q, _ in queue):
-                continue
+            if id(f) not in separated:
+                owner = next((m.frame for m in active if self._same(m.frame, f, "cand_known")), None)
+                twin = owner or next((q for q, _ in queue if self._same(q, f, "cand_queue")), None)
+                if twin is not None:
+                    if p.shadow_sv is not None:
+                        near.append((twin, f, occupied_overlap(twin, f).min_sv,
+                                     "cand_known" if owner is not None else "cand_queue"))
+                    continue
             queue.append((f, rid))
         forced = None
         while queue:
@@ -404,8 +476,8 @@ class BeamEngine:
             batch: list[tuple[Frame, int | None]] = []
             while queue and len(batch) < p.max_lineages:
                 f, rid = queue.popleft()
-                if any(self._same(m.frame, f, "cand_known") for m in live):  # admitted from an earlier batch
-                    continue
+                if id(f) not in separated and any(self._same(m.frame, f, "cand_known") for m in live):
+                    continue  # admitted from an earlier batch
                 if admission_slot(f.energy - tol.admit_de, energies, p.max_lineages, self._protected())[0] == "full":
                     events.append(("full", None))  # no slot even at the lowest energy admission may return
                     continue
@@ -421,23 +493,39 @@ class BeamEngine:
                 stable = self._same(f, e.lineage.last_frame, "admit") and abs(r.energy - f.energy) < tol.admit_de
                 if not (res.converged and stable):
                     events.append(("unstable", None))
-                elif any(self._same(m.frame, e.lineage.last_frame, "duplicate") for m in self._active()):
+                    verdict = "unstable"
+                elif id(f) not in separated and \
+                        any(self._same(m.frame, e.lineage.last_frame, "duplicate") for m in self._active()):
                     events.append(("duplicate", None))  # re-converged onto a lineage, e.g. one admitted this batch
+                    verdict = "duplicate"
                 else:
+                    n = len(events)
                     self._admit(e, r, rid, events, scf_result=res)
+                    verdict = next((f"{k}:{i}" for k, i in events[n:] if k in ("spawn", "revive")), "full")
+                if id(f) in separated:
+                    shadow_log.append(dict(id=separated[id(f)], event="admission", verdict=verdict))
         if not self._active() and forced is not None:  # never end a step with an empty beam (spec §5.4)
             self._admit(forced[0], forced[1], forced[2], events, kind="forced", scf_result=forced[3])
         if not self._active():
             raise RuntimeError(f"step {step}: no converged electronic state")
 
         # 4. merge lineages on one state, keep the lower (spec §4.5)
+        #    With shadows on (design 2026-10-26), sigma >= same_state_sv merges only if sigma >= shadow_sv (one state
+        #    within the noise) or |dE| <= accept_de (not separated): two branches with separation evidence are kept,
+        #    by the same test that promotes a shadow (review 2026-10-28 #1).
         kept: list[_Member] = []
         for m in sorted(self._active(), key=lambda m: m.result.energy):
-            if any(self._same(k.frame, m.frame, "merge") for k in kept):
+            twins = [k for k in kept if self._same(k.frame, m.frame, "merge")]
+            apart = [k for k in twins if self._separated(k, m)]
+            if twins and len(apart) < len(twins):
                 m.status = LineageStatus.PRUNED
                 events.append(("merge", m.id))
             else:
                 kept.append(m)
+                for k in apart:
+                    shadow_log.append(dict(event="kept_apart", lineages=[k.id, m.id],
+                                           sv=occupied_overlap(k.frame, m.frame).min_sv,
+                                           de_mha=1e3 * (m.result.energy - k.result.energy)))
         active = kept
 
         # 5. select; forces only for the selected lineage (spec §4.6)
@@ -511,6 +599,25 @@ class BeamEngine:
             if not any(self._same(g, f, "pending_new") for g in [m.frame for m in active] + [c.frame for c in still] + fresh):
                 fresh.append(f)
         self._pending = still + [_Carry(f, step) for f in fresh]
+        if p.shadow_sv is not None:  # one shadow per kept frame: its most different near duplicate (design 2026-10-26)
+            best: dict[int, tuple[Frame, Frame, float, str]] = {}
+            for k, f, sv, where in near:
+                if sv < p.shadow_sv and (id(k) not in best or sv < best[id(k)][2]):
+                    best[id(k)] = (k, f, sv, where)
+            # Or all of them, most different first, one per sigma >= shadow_sv group below: G2 x 4 t1 lost B when the
+            # slot of B' went to another near duplicate (analysis docs/2026-11-01-shadow-slot-analysis.zh-CN.md, S1).
+            cands = best.values() if p.shadow_per_frame else \
+                sorted((n for n in near if n[2] < p.shadow_sv), key=lambda n: n[2])
+            new = []
+            for k, f, sv, where in cands:
+                if not any(occupied_overlap(g.frame, f).min_sv >= p.shadow_sv for g in still_shadows + new):
+                    new.append(_Shadow(f, step, self._next_shadow))
+                    shadow_log.append(dict(id=self._next_shadow, event="registered", source=where, sv=sv,
+                                           energy=f.energy, de_mha=1e3 * (f.energy - k.energy)))
+                    self._next_shadow += 1
+            self._shadows = still_shadows + new
+            trace["shadow"] = dict(shadow_trace, registered=len(new), alive=len(self._shadows),
+                                   alive_ids=[h.id for h in self._shadows], log=shadow_log)
         trace["pending"]["alive"] = len(self._pending)
         # Unknown = a refresh candidate left unconverged, or a pending candidate that expired unresolved. A search's
         # own pending no longer counts: it is being continued, and counting it let every densified search extend

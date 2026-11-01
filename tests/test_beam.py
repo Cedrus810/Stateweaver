@@ -906,3 +906,129 @@ def test_random_orientations_are_sampled_only_inside_the_densify_window(water, g
     assert res[1].trace["search"]["random"] == dict(n=2, converged=2)
     assert [t["tag"] for t in res[1].trace["tasks"]].count("random") == 2
     assert "random" not in (res[0].trace["search"] or {})
+
+
+def near_twin(f, cos=0.95):
+    """f with its alpha HOMO turned towards the alpha LUMO: occupied sigma_min = cos, unconverged."""
+    C = f.mo_coeff.copy()
+    homo, lumo = np.flatnonzero(f.mo_occ[0] > 0)[-1], np.flatnonzero(f.mo_occ[0] == 0)[0]
+    t = np.arccos(cos)
+    C[0][:, [homo, lumo]] = C[0][:, [homo, lumo]] @ np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+    return Frame.from_orbitals(f.mol, C, f.mo_occ, f.energy + 1e-6)
+
+
+def search_with_near_twin(ground, monkeypatch):
+    left = [1]
+
+    def search(executor, mol, bases, metal_atoms, keep_window, tol, near_sv=None, **kw):
+        if not left:
+            return SearchResult([], 0, 0, ("minao",), ())
+        left.pop()
+        g = at(mol, ground)
+        return SearchResult([g], 1, 0, ("minao",), (), near_dups=((g, near_twin(g), 0.95),))
+
+    monkeypatch.setattr("sroqm.beam.full_search", search)
+
+
+def test_a_near_duplicate_is_shadowed_and_dropped_once_it_reconverges_onto_the_lineage(water, ground, monkeypatch):
+    search_with_near_twin(ground, monkeypatch)
+    b = beam(water, shadow_sv=0.999)
+    first = b.compute(water.atom_coords())
+    assert first.trace["shadow"]["registered"] == 1 and first.trace["shadow"]["alive"] == 1
+    second = b.compute(water.atom_coords())
+    assert [t["tag"] for t in second.trace["tasks"]].count("shadow") == 1
+    sh = second.trace["shadow"]
+    assert {k: sh[k] for k in ("carried", "same", "separated", "nc", "expired", "registered", "alive")} == \
+        dict(carried=1, same=1, separated=0, nc=0, expired=0, registered=0, alive=0)
+    # review 2026-10-28 #2: every shadow has a stable id and a recorded fate
+    (reg,) = first.trace["shadow"]["log"]
+    assert reg["event"] == "registered" and reg["source"] == "search" and reg["sv"] == pytest.approx(0.95, abs=1e-6)
+    (fate,) = sh["log"]
+    assert fate["id"] == reg["id"] and fate["event"] == "same" and fate["lineages"][0][1] >= 0.999
+
+
+def test_one_kept_frame_with_two_near_duplicates_shadows_both_unless_one_per_frame(water, ground, monkeypatch):
+    """G2 x 4 t1 (analysis 2026-11-01): B and another near duplicate both merged into B'; one slot per kept frame kept
+    only the most different one and lost B. shadow_per_frame=False shadows both (they are sigma < 0.999 apart)."""
+    def search_with_two_twins():
+        left = [1]
+
+        def search(executor, mol, bases, metal_atoms, keep_window, tol, near_sv=None, **kw):
+            if not left:
+                return SearchResult([], 0, 0, ("minao",), ())
+            left.pop()
+            g = at(mol, ground)
+            return SearchResult([g], 1, 0, ("minao",), (),
+                                near_dups=((g, near_twin(g, 0.95), 0.95), (g, near_twin(g, 0.97), 0.97)))
+        monkeypatch.setattr("sroqm.beam.full_search", search)
+
+    search_with_two_twins()
+    one = beam(water, shadow_sv=0.999).compute(water.atom_coords()).trace["shadow"]
+    assert one["registered"] == 1 and one["log"][0]["sv"] == pytest.approx(0.95, abs=1e-6)
+    search_with_two_twins()
+    both = beam(water, shadow_sv=0.999, shadow_per_frame=False).compute(water.atom_coords()).trace["shadow"]
+    assert both["registered"] == 2 and [e["sv"] for e in both["log"]] == pytest.approx([0.95, 0.97], abs=1e-6)
+
+
+class ShadowsLandOn(SerialExecutor):
+    """Every `shadow` task returns `frame` (orbitals, density, energy + shift) as converged: a stand-in for a shadow
+    that has drifted to that point."""
+
+    def __init__(self, backend, frame, shift=0.0):
+        super().__init__(backend)
+        self.frame, self.shift = frame, shift
+
+    def map(self, tasks):
+        out = super().map(tasks)
+        return [dataclasses.replace(r, outcome=dataclasses.replace(
+                    r.outcome, mo_coeff=self.frame.mo_coeff, mo_occ=self.frame.mo_occ, dm=self.frame.dm,
+                    energy=self.frame.energy + self.shift, converged=True))
+                if t.tag == "shadow" else r for t, r in zip(tasks, out)]
+
+
+def test_a_shadow_on_another_state_becomes_an_ordinary_candidate(water, ground, excited_water, monkeypatch):
+    search_with_near_twin(ground, monkeypatch)
+    b = beam(water, executor=ShadowsLandOn(uks(), excited_water), shadow_sv=0.999)
+    b.compute(water.atom_coords())
+    res = b.compute(water.atom_coords())
+    assert res.trace["shadow"]["separated"] == 1 and ("spawn", 1) in res.events
+
+
+def test_a_separated_shadow_reaches_admission_although_sigma_calls_it_the_lineage(water, ground, monkeypatch):
+    # sigma 0.95 to the ground lineage (one state by sigma >= 0.9) but 0.1 mHa above it (> accept_de): separated, so
+    # it is not skipped as "known"; admission re-converges it onto the ground state, 0.1 mHa away: unstable
+    search_with_near_twin(ground, monkeypatch)
+    b = beam(water, executor=ShadowsLandOn(uks(), near_twin(ground), shift=1e-4), shadow_sv=0.999)
+    b.compute(water.atom_coords())
+    res = b.compute(water.atom_coords())
+    assert res.trace["shadow"]["separated"] == 1
+    assert "admit" in [t["tag"] for t in res.trace["tasks"]] and ("unstable", None) in res.events
+    assert [(e["event"], e.get("verdict")) for e in res.trace["shadow"]["log"]] == [("separated", None),
+                                                                                ("admission", "unstable")]
+    b2 = beam(water, executor=ShadowsLandOn(uks(), near_twin(ground), shift=1e-6), shadow_sv=0.999)
+    search_with_near_twin(ground, monkeypatch)
+    b2.compute(water.atom_coords())
+    res2 = b2.compute(water.atom_coords())  # same sigma, 0.001 mHa: not separated yet, still followed
+    assert res2.trace["shadow"]["separated"] == 0 and res2.trace["shadow"]["alive"] == 1
+
+
+def test_shadows_are_off_by_default(water, ground, monkeypatch):
+    search_with_near_twin(ground, monkeypatch)
+    b = beam(water)
+    b.compute(water.atom_coords())
+    res = b.compute(water.atom_coords())
+    assert "shadow" not in res.trace and "shadow" not in [t["tag"] for t in res.trace["tasks"]]
+
+
+def test_lineages_with_separation_evidence_are_not_merged(water, ground):
+    # review 2026-10-28 #1: with shadows on, sigma >= 0.9 merges only within the noise (sigma >= shadow_sv) or before
+    # the two have separated (|dE| <= accept_de); otherwise both branches stay
+    from types import SimpleNamespace
+    twin = near_twin(ground)  # sigma 0.95 to ground
+    a = SimpleNamespace(frame=ground, result=SimpleNamespace(energy=ground.energy))
+    far = SimpleNamespace(frame=twin, result=SimpleNamespace(energy=ground.energy + 1e-4))
+    close = SimpleNamespace(frame=twin, result=SimpleNamespace(energy=ground.energy + 1e-5))
+    same = SimpleNamespace(frame=ground, result=SimpleNamespace(energy=ground.energy + 1e-4))
+    on, off = beam(water, shadow_sv=0.999), beam(water)
+    assert on._separated(a, far) and not on._separated(a, close) and not on._separated(a, same)
+    assert not off._separated(a, far)  # shadows off: the old rule, sigma alone

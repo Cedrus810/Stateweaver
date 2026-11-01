@@ -356,3 +356,21 @@ def test_random_orientations_keep_the_electron_count_and_the_block_subspace(fe_i
         hole_dirs.append(d)
     assert abs(hole_dirs[0] @ S @ hole_dirs[1]) < 0.999  # different directions
     assert random_orientation_tasks(fe_ion.mol, fe_ion, [], 4, np.random.default_rng(0)) == []
+
+
+def test_the_dedupe_hands_on_near_duplicates_below_near_sv(water):
+    # design 2026-10-26: a candidate merged at sigma < near_sv may be another stationary point (R2 t2: sigma 0.992)
+    from sroqm.search import _dedupe
+    g = Frame.from_outcome(water, PySCFBackend(MethodSpec("rks/b3lyp")).run(water, with_gradient=False))
+    C = g.mo_coeff.copy()
+    homo, lumo = np.flatnonzero(g.mo_occ > 0)[-1], np.flatnonzero(g.mo_occ == 0)[0]
+    t = np.arccos(0.95)
+    C[:, [homo, lumo]] = C[:, [homo, lumo]] @ np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+    near_twin = Frame.from_orbitals(water, C, g.mo_occ, g.energy + 1e-6)
+    near = []
+    assert _dedupe([near_twin, g], 0.9, near=near, near_sv=0.999) == [g]
+    ((kept, dropped, sv),) = near
+    assert kept is g and dropped is near_twin and sv == pytest.approx(0.95, abs=1e-6)
+    near = []
+    _dedupe([near_twin, g], 0.9, near=near, near_sv=0.94)
+    assert near == []

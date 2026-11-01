@@ -117,17 +117,23 @@ def d_occupation_patterns(base: Frame, metal_atoms, min_pop: float = 0.5, window
     return out
 
 
-def _dedupe(frames: list[Frame], same_state_sv: float, merged: list | None = None, stage: str = "") -> list[Frame]:
+def _dedupe(frames: list[Frame], same_state_sv: float, merged: list | None = None, stage: str = "",
+            near: list | None = None, near_sv: float | None = None) -> list[Frame]:
     """Distinct frames, lowest first. `merged` collects (stage, sigma_min, E_dropped - E_kept) of every frame dropped as
-    the same state as a kept one (design memo 2026-10-23 §2.2 2a: is sigma >= 0.9 too loose near B?)."""
+    the same state as a kept one (design memo 2026-10-23 §2.2 2a: is sigma >= 0.9 too loose near B?). `near` collects
+    (kept, dropped, sigma_min) for every drop with sigma_min < near_sv: a near duplicate that may be another stationary
+    point (R2 t2: B' and B at sigma 0.992), to be shadowed (design 2026-10-26)."""
     kept: list[Frame] = []
     for f in sorted(frames, key=lambda f: f.energy):
         svs = [occupied_overlap(k, f).min_sv for k in kept]
         if all(sv < same_state_sv for sv in svs):
             kept.append(f)
-        elif merged is not None:
-            i = int(np.argmax(svs))
+            continue
+        i = int(np.argmax(svs))
+        if merged is not None:
             merged.append((stage, svs[i], f.energy - kept[i].energy))
+        if near is not None and near_sv is not None and svs[i] < near_sv:
+            near.append((kept[i], f, svs[i]))
     return kept
 
 
@@ -169,6 +175,7 @@ class SearchResult:
     pending_frames: tuple = ()  # the pending candidates' last (unconverged) frames, to continue later (design §5.2)
     merged: tuple = ()      # (stage, sigma_min, dE in Ha) of every candidate the dedupe dropped as a duplicate
     window_frames: tuple = ()  # every converged candidate within keep_window of the lowest, before the dedupe
+    near_dups: tuple = ()   # (kept, dropped, sigma_min) with sigma_min < near_sv, dropped within keep_window
 
 
 def enumeration_tasks(mol, base: Frame, metal_atoms, include_own: bool, max_cycle=None, point_charges=None,
@@ -261,7 +268,8 @@ def _pending(results, keep, lowest, keep_window):
 
 
 def full_search(executor, mol, bases, metal_atoms, keep_window, tol, point_charges=None, retry_guesses=False,
-                guesses=("minao", "atom", "huckel"), merge_guesses=False, anchor=None, screen=None) -> SearchResult:
+                guesses=("minao", "atom", "huckel"), merge_guesses=False, anchor=None, screen=None,
+                near_sv=None) -> SearchResult:
     """Two-level full search (spec §5.3-5.4).
 
     Level 1: scratch SCF + enumeration from every frame in `bases` (the lowest lineage, the lineages lost this
@@ -281,7 +289,7 @@ def full_search(executor, mol, bases, metal_atoms, keep_window, tol, point_charg
     converged state is known). Scratch SCFs are never screened.
     """
     enum, dropped, dropped_de = [], 0, []  # every enumeration result with whether the screen kept it
-    merged, converged = [], []             # dedupe records; every converged candidate frame
+    merged, converged, near = [], [], []   # dedupe records; every converged candidate frame; near duplicates
 
     def run(tasks, anchor_now):
         nonlocal dropped
@@ -304,7 +312,7 @@ def full_search(executor, mol, bases, metal_atoms, keep_window, tol, point_charg
         tried = list(guesses)
         converged += [s.frame for s in scratches if s.converged] + [r.frame for r in found if r.converged]
         level1 = _dedupe([s.frame for s in scratches if s.converged] + [r.frame for r in found if r.converged],
-                         tol.same_state_sv, merged, "level1")
+                         tol.same_state_sv, merged, "level1", near, near_sv)
         guesses = ()  # level 1 is done; skip the sequential loop below
     else:
         tried, level1 = [], []
@@ -322,7 +330,7 @@ def full_search(executor, mol, bases, metal_atoms, keep_window, tol, point_charg
                                           tag="l1:scratch"), _lowest(anchor, [scratch]))
         converged += ([scratch.frame] if scratch.converged else []) + [r.frame for r in found if r.converged]
         level1 = _dedupe(([scratch.frame] if scratch.converged else []) + [r.frame for r in found if r.converged],
-                         tol.same_state_sv, merged, "level1")
+                         tol.same_state_sv, merged, "level1", near, near_sv)
         if level1 or not retry_guesses:
             break
     if not level1:
@@ -336,8 +344,10 @@ def full_search(executor, mol, bases, metal_atoms, keep_window, tol, point_charg
                   for t in enumeration_tasks(mol, f, metal_atoms, False, point_charges=point_charges, tag="l2")],
                  min(e for e in (anchor, level1[0].energy) if e is not None))
     converged += [r.frame for r in found2 if r.converged]
-    states = _dedupe(level1 + [r.frame for r in found2 if r.converged], tol.same_state_sv, merged, "level2")
+    states = _dedupe(level1 + [r.frame for r in found2 if r.converged], tol.same_state_sv, merged, "level2", near,
+                     near_sv)
     pending = _pending([r for r, _ in enum], [k for _, k in enum], states[0].energy, keep_window)  # spec 10-05 §5.3
     window = tuple(sorted((f for f in converged if f.energy - states[0].energy <= keep_window), key=lambda f: f.energy))
+    near = tuple((k, f, sv) for k, f, sv in near if f.energy - states[0].energy <= keep_window)
     return SearchResult(states, len(level1), len(states) - len(level1), tuple(tried), tuple(seeds), len(pending),
-                        dropped, tuple(dropped_de), tuple(r.frame for r in pending), tuple(merged), window)
+                        dropped, tuple(dropped_de), tuple(r.frame for r in pending), tuple(merged), window, near)
