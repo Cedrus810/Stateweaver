@@ -1,6 +1,8 @@
 # Stateful Reduced-Order QM/MM  
 ## 核空间导航与电子空间导航的双层自动化框架
 
+> 实现状态更新（2026-10-29）：Phase 3b 已通过现有 FeII 固定自旋投影扇区的 ref3 开发基准：G1 11步×4、G2 60步×4均0 miss/0 warn；筛选关闭对照亦4/4通过。见[验收报告](docs/2026-10-29-phase3b-acceptance-report.zh-CN.md)与[成本报告](docs/2026-10-29-phase3b-cost-report.zh-CN.md)。下文早期Phase 3b待办保留为设计历史，当前实现以报告为准。独立留出验证、配位事件模块、heme多态及完整QM/MM尚未完成；首篇论文范围建议见[论文准备度梳理](docs/2026-10-29-paper-readiness.zh-CN.md)。
+
 > v2 修订说明（相对 v1，原稿保存为 `*.v1.md`）：
 >
 > 1. 重新定位创新点：核心贡献是**多 lineage 电子态管理 + 显式电子歧义输出**；低秩外推降级为采用已有方法（ASPC / XL-BOMD / Grassmann extrapolation）的工程组件。

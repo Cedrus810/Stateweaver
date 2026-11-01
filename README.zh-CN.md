@@ -30,10 +30,20 @@ SCF 解（scratch/aufbau 加上每种金属 d 占据，用 MOM 收敛）；
 Phase 1（continuation 基线）、Phase 2（单 lineage 有状态引擎）和 Phase 3a（态搜索 + 多 lineage
 beam）。Phase 3b（近简并流形上的 beam 卫生规则与发现调度：逐 lineage 循环预算、候选准入测试、
 丢失/休眠语义、刷新调度、两层完整搜索、显式 DEGENERATE 输出）已按 2026-10-02 与 2026-10-05 的
-实施计划实现，对照 ref3 的验收尚未通过：traj2 第 0–20 步 4 / 4 次回放全过（这一版第 21–59 步未回放），
-对称起点 2 次里 1 次漏；含完整搜索的步骤占总时间 68–88%（见 `state.md` §4.15 与
-`docs/2026-10-11-search-performance-design.zh-CN.md`）。XL-BOMD、
+实施计划实现，**截至 2026-10-29 已通过现有 ref3 开发基准**：G1 对称起点 11 步 × 4、
+G2 traj2 60 步 × 4 均为 0 miss / 0 warn，筛选关闭的 traj2 对照也 4 / 4 通过。
+这依赖下方显式回放配置，库里的新增发现开关仍默认关闭。见
+[验收报告](docs/2026-10-29-phase3b-acceptance-report.zh-CN.md)、
+[成本报告](docs/2026-10-29-phase3b-cost-report.zh-CN.md)与
+[论文准备度梳理](docs/2026-10-29-paper-readiness.zh-CN.md)。
+验证范围限于已有 FeII 路径与固定自旋投影扇区，独立留出路径、更广的态覆盖与配位事件跟踪尚待验证；
+下一阶段沿既定路线做固定 QM 路径上的配位/电子态联合跟踪。XL-BOMD、
 MM 端梯度 / OpenMM 耦合、ORCA 后端也未开始。相邻多重度（M±2）与破对称候选排在 Phase 3b 之后。
+
+验收回放配置：`--densify-steps 4 --escalate-unknown 2 --screen-margin-mha 5
+--densify-random 40 --shadow-sv 0.999`（随机取向只在对称起点的加密窗口生效）。
+参数仅在开发体系校准。部分 PBS 验证使用 NFS 上的环境，是本地环境运行建议的例外；
+不同机器与执行方式的墙钟不能直接比较。
 
 ## 安装
 

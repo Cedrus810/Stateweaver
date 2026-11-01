@@ -39,13 +39,24 @@ Implements Phase 1 (continuation baseline), Phase 2 (single-lineage stateful eng
 [design spec](<Stateful Reduced-Order QM-MM：核空间与电子空间的双层自动化框架.md>) (Chinese).
 Phase 3b — beam hygiene rules and discovery scheduling on near-degenerate manifolds (per-lineage
 SCF budgets, a candidate admission test, lost/dormant semantics, refresh scheduling, a two-layer
-full search, explicit DEGENERATE output) — is implemented (plans 2026-10-02 and 2026-10-05) but has
-not passed acceptance against the ref3 references: traj2 steps 0–20 pass in 4 of 4 replays (steps
-21–59 not yet replayed with this version), the symmetric start fails in 1 of 2 replays, and steps
-with a full search take 68–88% of the wall time (see `state.md` §4.15 and
-`docs/2026-10-11-search-performance-design.zh-CN.md`). Not started:
+full search, explicit DEGENERATE output) — passed the current ref3 development benchmarks on
+2026-10-29: symmetric-start G1 (11 steps × 4) and traj2 G2 (60 steps × 4), with zero misses and
+warnings. This uses the explicit benchmark configuration below; these discovery options remain
+disabled by default in the library. Screening-off traj2 replays also passed 4/4. See the
+[acceptance report](docs/2026-10-29-phase3b-acceptance-report.zh-CN.md),
+[cost report](docs/2026-10-29-phase3b-cost-report.zh-CN.md), and
+[paper-readiness review](docs/2026-10-29-paper-readiness.zh-CN.md) (Chinese).
+Validation is limited to the existing Fe(II) paths and fixed spin-projection sector; independent
+held-out paths, broader state coverage, and coordination-event tracking remain to be validated.
+The next stage is joint coordination/electronic-lineage tracking on fixed QM paths. Not started:
 XL-BOMD, MM-side gradients / OpenMM coupling, ORCA backend. Search candidates from neighbouring
 multiplicities (M±2) and broken-symmetry solutions are planned after Phase 3b.
+
+Accepted benchmark options: `--densify-steps 4 --escalate-unknown 2 --screen-margin-mha 5
+--densify-random 40 --shadow-sv 0.999` (`densify-random` acts in the symmetric-start discovery
+window). These parameters were calibrated on the development system. Some PBS validation runs
+used an NFS-hosted environment, an exception to the local-environment recommendation; wall times
+across different hosts and execution modes are not directly comparable.
 
 ## Installation
 
