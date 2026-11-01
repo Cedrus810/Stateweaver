@@ -72,7 +72,10 @@ def test_an_energy_verdict_above_the_noise_is_a_warning():
     from bench_beam import StepVerdict, is_warn
     assert is_warn(StepVerdict(True, "energy", 0.55, 0.045))       # traj2 step 5 of the runs that had lost B
     assert not is_warn(StepVerdict(True, "energy", 0.50, 0.0000))  # degenerate orientation, same energy
-    assert not is_warn(StepVerdict(True, "same-state", 1.0, 0.045))
+    # design memo 2026-10-23 §7 2d: a same-state pass far above the best known is another stationary point
+    assert is_warn(StepVerdict(True, "same-state", 0.91, 0.201))   # R2 t2 step 5's lineage 1, had it been selected
+    assert not is_warn(StepVerdict(True, "same-state", 0.998, 0.0156))  # the largest same-state dE so far (R2)
+    assert not is_warn(StepVerdict(True, "degenerate-band", 0.5, 0.08))
 
 
 def test_cli_passes_the_discovery_switches_and_records_the_params(tmp_path, water, monkeypatch):
@@ -91,10 +94,10 @@ def test_cli_passes_the_discovery_switches_and_records_the_params(tmp_path, wate
     with pytest.raises(Stop):
         main(["--coords", str(tmp_path / "coords.npy"), "--prefix", "w", "--out", str(tmp_path / "r.json"),
               "--system", "water", "--basis", "6-31g", "--method", "rks/b3lyp", "--metal-atoms", "",
-              "--densify-steps", "4", "--escalate-unknown", "2", "--screen-margin-mha", "5", "--densify-random", "40"])
+              "--densify-steps", "4", "--escalate-unknown", "2", "--screen-margin-mha", "5", "--densify-random", "40", "--shadow-sv", "0.999", "--shadow-steps", "4"])
     p = seen["params"]
     assert (p.densify_steps, p.escalate_unknown, p.screen_margin) == (4, 2, pytest.approx(5e-3))
-    assert p.densify_random == 40
+    assert p.densify_random == 40 and (p.shadow_sv, p.shadow_steps) == (0.999, 4)
 
 
 def test_a_missed_or_warned_replay_exits_with_its_own_code(tmp_path, water, monkeypatch):

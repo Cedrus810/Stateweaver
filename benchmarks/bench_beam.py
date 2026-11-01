@@ -4,7 +4,8 @@ Each reference step is an .npz with the energies of every state found and the lo
 (on the 40-core node: ~/sroqm/out/ref3/<prefix>_<k:03d>.npz). A step passes if the selected lineage is the reference's
 state (occupied sigma_min >= same_state_sv), else if it is within accept_de of the best known energy, else if
 the beam flagged DEGENERATE and it is within deg_band (spec §3). An `energy` pass more than WARN_DE_MHA above the
-best known is reported as a warning and fails the run.
+best known is reported as a warning and fails the run; so is a same-state pass that far above it (design memo
+2026-10-23 §7, 2d: sigma >= 0.9 also joins stationary points 0.04-0.24 mHa apart).
 
 Exit code: 0 every step passed without warning; 3 a miss or a warning (the run finished; see SUMMARY); anything else
 (1 for an uncaught exception) means the replay itself failed (review 2026-10-23 #4: 1 used to mean both).
@@ -51,8 +52,10 @@ WARN_DE_MHA = 0.02  # same-state convergence noise at conv_tol=1e-7 is <= 0.016 
 
 
 def is_warn(v: StepVerdict) -> bool:
-    """An energy-only pass well above the noise: traj2 step 5 hid a lost state this way (spec 2026-10-05 §3.2)."""
-    return v.reason == "energy" and v.de_mha > WARN_DE_MHA
+    """A pass more than the same-state noise above the best known: an energy-only pass (traj2 step 5 hid a lost state
+    this way, spec 2026-10-05 §3.2), or a same-state pass (sigma >= same_state_sv but a different stationary point,
+    e.g. R2 t2 step 5: sigma 0.91, +0.2 mHa; design memo 2026-10-23 §7 option 2d, user: "2d做了。。。")."""
+    return v.reason in ("energy", "same-state") and v.de_mha > WARN_DE_MHA
 
 
 def judge_step(selected: Frame, degenerate: bool, reference: Frame, tol: Tolerances) -> StepVerdict:
@@ -175,6 +178,11 @@ def main(argv=None) -> int:
                     help="screen search candidates at keep_window + this many mHa (BeamParams.screen_margin)")
     ap.add_argument("--densify-random", type=int, default=0,
                     help="random t2g-orientation SCFs on each densify-window step (BeamParams.densify_random)")
+    ap.add_argument("--shadow-sv", type=float, default=None,
+                    help="follow near duplicates merged below this sigma (BeamParams.shadow_sv; design 2026-10-26)")
+    ap.add_argument("--shadow-steps", type=int, default=5, help="... for at most this many steps")
+    ap.add_argument("--shadow-all", action="store_true",
+                    help="shadow every near duplicate, not one per kept frame (BeamParams.shadow_per_frame=False)")
     ap.add_argument("--workers", type=int, default=0,
                     help="run the SCFs on this many worker processes (ProcessExecutor); 0: serial in this process")
     ap.add_argument("--worker-threads", type=int, default=1,
@@ -199,7 +207,8 @@ def main(argv=None) -> int:
     metals = [int(i) for i in args.metal_atoms.split(",") if i.strip()]
     coords = np.load(args.coords)[: args.steps]
     params = BeamParams(densify_steps=args.densify_steps, escalate_unknown=args.escalate_unknown,
-                        densify_random=args.densify_random,
+                        densify_random=args.densify_random, shadow_sv=args.shadow_sv,
+                        shadow_steps=args.shadow_steps, shadow_per_frame=not args.shadow_all,
                         screen_margin=None if args.screen_margin_mha is None else 1e-3 * args.screen_margin_mha)
     executor = None
     if args.workers:
