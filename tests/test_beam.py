@@ -970,6 +970,21 @@ def test_one_kept_frame_with_two_near_duplicates_shadows_both_unless_one_per_fra
     assert both["registered"] == 2 and [e["sv"] for e in both["log"]] == pytest.approx([0.95, 0.97], abs=1e-6)
 
 
+def test_no_shadow_is_registered_on_densify_steps_when_asked(water, ground, excited_water, monkeypatch):
+    """Analysis 2026-11-02 D1: on densify steps every promoted shadow sat above a full beam and was never admitted, so
+    shadow_skip_densify registers none there; the start step (and every other step) registers as before."""
+    def search(executor, mol, bases, metal_atoms, keep_window, tol, near_sv=None, **kw):
+        g, x = at(mol, ground), at(mol, excited_water)
+        return SearchResult([g, x], 2, 0, ("minao",), (), near_dups=((g, near_twin(g), 0.95),))
+
+    for skip, expect in ((False, [1, 1]), (True, [1, 0])):
+        monkeypatch.setattr("sroqm.beam.full_search", search)
+        b = beam(water, tol=DEG, densify_steps=1, shadow_sv=0.999, shadow_skip_densify=skip)
+        res = [b.compute(water.atom_coords()) for _ in range(2)]
+        assert [r.trace["search"]["reason"] for r in res] == ["start", "densify"]
+        assert [r.trace["shadow"]["registered"] for r in res] == expect
+
+
 class ShadowsLandOn(SerialExecutor):
     """Every `shadow` task returns `frame` (orbitals, density, energy + shift) as converged: a stand-in for a shadow
     that has drifted to that point."""

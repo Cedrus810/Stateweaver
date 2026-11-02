@@ -608,6 +608,10 @@ class BeamEngine:
             # slot of B' went to another near duplicate (analysis docs/2026-11-01-shadow-slot-analysis.zh-CN.md, S1).
             cands = best.values() if p.shadow_per_frame else \
                 sorted((n for n in near if n[2] < p.shadow_sv), key=lambda n: n[2])
+            # None on densify steps if asked: there, every promoted shadow sat above a full beam and was never admitted
+            # (G1, both slot rules; analysis docs/2026-11-02-shadow-cost-symmetric-start.zh-CN.md, D1).
+            if p.shadow_skip_densify and reason == "densify":
+                cands = []
             new = []
             for k, f, sv, where in cands:
                 if not any(occupied_overlap(g.frame, f).min_sv >= p.shadow_sv for g in still_shadows + new):

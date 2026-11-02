@@ -31,6 +31,7 @@ class BeamParams:
     shadow_sv: float | None = None         # shadow near duplicates merged below this sigma (design 2026-10-26); None: off
     shadow_steps: int = 5                  # ... for at most this many steps
     shadow_per_frame: bool = True          # one shadow per kept frame; False: all (analysis 2026-11-01 S1)
+    shadow_skip_densify: bool = False      # register no shadow on densify steps (analysis 2026-11-02 D1)
 
     def __post_init__(self):
         if self.max_lineages < 1 or self.n_prune < 1:

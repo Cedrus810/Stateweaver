@@ -183,6 +183,8 @@ def main(argv=None) -> int:
     ap.add_argument("--shadow-steps", type=int, default=5, help="... for at most this many steps")
     ap.add_argument("--shadow-all", action="store_true",
                     help="shadow every near duplicate, not one per kept frame (BeamParams.shadow_per_frame=False)")
+    ap.add_argument("--shadow-skip-densify", action="store_true",
+                    help="register no shadow on densify steps (BeamParams.shadow_skip_densify)")
     ap.add_argument("--workers", type=int, default=0,
                     help="run the SCFs on this many worker processes (ProcessExecutor); 0: serial in this process")
     ap.add_argument("--worker-threads", type=int, default=1,
@@ -209,6 +211,7 @@ def main(argv=None) -> int:
     params = BeamParams(densify_steps=args.densify_steps, escalate_unknown=args.escalate_unknown,
                         densify_random=args.densify_random, shadow_sv=args.shadow_sv,
                         shadow_steps=args.shadow_steps, shadow_per_frame=not args.shadow_all,
+                        shadow_skip_densify=args.shadow_skip_densify,
                         screen_margin=None if args.screen_margin_mha is None else 1e-3 * args.screen_margin_mha)
     executor = None
     if args.workers:
