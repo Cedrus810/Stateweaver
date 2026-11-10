@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from sroqm.testsystems import DEFAULT_METHOD, build, fe_hexaaqua_atoms
+from sroqm.testsystems import DEFAULT_METHOD, build, fe_hexaaqua_atoms, fe_pentaaqua_ammine_atoms
 
 
 def test_fe_hexaaqua_geometry():
@@ -19,8 +19,25 @@ def test_fe_hexaaqua_geometry():
     assert hh.min() > 1.4  # no H-H clashes (intra-water H-H is ~1.52 A)
 
 
+def test_fe_pentaaqua_ammine_geometry():
+    # the +x water of fe_hexaaqua swapped for NH3; the other five waters unchanged
+    atoms = fe_pentaaqua_ammine_atoms()
+    sym = [s for s, _ in atoms]
+    xyz = np.array([p for _, p in atoms])
+    assert sym[:5] == ["Fe", "N", "H", "H", "H"] and sym.count("O") == 5 and sym.count("H") == 13
+    assert np.allclose(xyz[1], [2.20, 0, 0])
+    for h in xyz[2:5]:
+        assert np.linalg.norm(h - xyz[1]) == pytest.approx(1.015)
+        cos = np.dot(xyz[0] - xyz[1], h - xyz[1]) / (np.linalg.norm(xyz[0] - xyz[1]) * np.linalg.norm(h - xyz[1]))
+        assert np.degrees(np.arccos(cos)) == pytest.approx(111.0)
+    assert [p for s, p in fe_hexaaqua_atoms() if s != "Fe"][3:] == [p for _, p in atoms[5:]]
+    h = xyz[[i for i, s in enumerate(sym) if s == "H"]]
+    assert np.linalg.norm(h[:, None] - h[None], axis=-1)[np.triu_indices(len(h), 1)].min() > 1.4
+
+
 @pytest.mark.parametrize("name, natm, charge, spin", [
-    ("water", 3, 0, 0), ("water_dimer", 6, 0, 0), ("fe2_hexaaqua", 19, 2, 4), ("fe3_hexaaqua", 19, 3, 5)])
+    ("water", 3, 0, 0), ("water_dimer", 6, 0, 0), ("fe2_hexaaqua", 19, 2, 4), ("fe3_hexaaqua", 19, 3, 5),
+    ("fe2_pentaaqua_ammine", 20, 2, 4)])
 def test_build(name, natm, charge, spin):
     mol = build(name, "sto-3g")
     assert (mol.natm, mol.charge, mol.spin) == (natm, charge, spin)
