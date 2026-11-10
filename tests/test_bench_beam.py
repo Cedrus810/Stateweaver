@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import numpy as np
@@ -62,6 +63,12 @@ def test_replay_and_cli_on_a_short_water_trajectory(tmp_path, water, water_step)
         (lin,) = r["lineages"]  # one state on water
         assert lin["sv_ref"] > 0.999 and abs(lin["de_ref_mha"]) < 1e-3 and r["e_ref"] < 0
     assert json.loads(out.read_text())["params"]["densify_steps"] == 0
+    # protocol 2026-11-06 §2.3: the run keeps the source it ran, named by md5
+    source = json.loads(out.read_text())["run"]["source"]
+    assert {"beam.py", "search.py", "bench_beam.py"} <= set(source)
+    snap = tmp_path / "result.src"
+    assert all(hashlib.md5((snap / n).read_bytes()).hexdigest() == h for n, h in source.items())
+    assert (snap / "MD5SUMS").read_text().count("\n") == len(source)
     assert all(r["peak_rss_mb"] > 0 and r["rss_mb"] > 0 for r in json.loads(out.read_text())["rows"])
     # every step is also in the JSON-lines file written as the run goes (survives a stopped run)
     streamed = [json.loads(line) for line in (tmp_path / "result.rows.jsonl").read_text().splitlines()]

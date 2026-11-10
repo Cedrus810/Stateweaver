@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import resource
 import time
@@ -29,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
+import sroqm
 from sroqm.backend import MethodSpec, PySCFBackend
 from sroqm.beam import BeamEngine
 from sroqm.beamrules import BeamParams
@@ -152,6 +154,21 @@ def replay(beam: BeamEngine, coords_list, ref_dir, prefix: str, tol: Tolerances,
     return rows
 
 
+def snapshot_source(out) -> dict[str, str]:
+    """Copy the code this replay runs (the imported sroqm package's *.py and this file) to <OUT>.src/ beside the JSON,
+    and return {file: md5}. Paper-1 protocol (docs/2026-11-06-paper1-validation-protocol.zh-CN.md §2.3): every new run
+    keeps its own source; the md5s only name the files, they gate nothing."""
+    dst = Path(out).with_suffix(".src")
+    dst.mkdir(parents=True, exist_ok=True)
+    md5 = {}
+    for f in sorted(Path(sroqm.__file__).parent.glob("*.py")) + [Path(__file__)]:
+        data = f.read_bytes()
+        (dst / f.name).write_bytes(data)
+        md5[f.name] = hashlib.md5(data).hexdigest()
+    (dst / "MD5SUMS").write_text("".join(f"{h}  {n}\n" for n, h in md5.items()))
+    return md5
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--coords", required=True)
@@ -206,6 +223,7 @@ def main(argv=None) -> int:
             backend = ReferenceBackend(ReferenceSpec(a=args.a, conv_tol=tol.conv_tol))
     if args.save_frames is not None:
         Path(args.save_frames).mkdir(parents=True, exist_ok=True)
+    source = snapshot_source(args.out)  # before the replay: a crashed run keeps it too
     metals = [int(i) for i in args.metal_atoms.split(",") if i.strip()]
     coords = np.load(args.coords)[: args.steps]
     params = BeamParams(densify_steps=args.densify_steps, escalate_unknown=args.escalate_unknown,
@@ -231,7 +249,7 @@ def main(argv=None) -> int:
                    missed=[r["step"] for r in rows if not r["passed"]],
                    warn=sum(r["warn"] for r in rows), warned=[r["step"] for r in rows if r["warn"]],
                    mean_s=float(t.mean()), median_s=float(np.median(t)), max_s=float(t.max()))
-    run = dict(workers=args.workers, worker_threads=args.worker_threads if args.workers else None)
+    run = dict(workers=args.workers, worker_threads=args.worker_threads if args.workers else None, source=source)
     Path(args.out).write_text(json.dumps(dict(params=dataclasses.asdict(params), run=run, summary=summary, rows=rows),
                                          indent=1))
     print(f"SUMMARY {summary}", flush=True)
