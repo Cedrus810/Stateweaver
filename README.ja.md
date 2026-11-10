@@ -41,7 +41,11 @@ G1（対称起点11ステップ×4）とG2（traj2 60ステップ×4）は見落
 検証範囲は既存のFeII経路と固定スピン射影セクターに限られ、独立した未使用経路、
 より広い状態の網羅、配位イベント追跡は未検証です。次段階は固定QM経路上での配位と電子状態の共同追跡です。
 XL-BOMD、MM 側の勾配 / OpenMM 連携、ORCA バックエンドは
-未着手です。
+未着手です。論文1（paper-1）検証プロトコル（2026-11-06）は一部確定済みです（2026-11-09）：
+実行ごとのソーススナップショット（`bench_beam.py` の `snapshot_source()`、§2.3）と
+L2 未使用系 `fe2_pentaaqua_ammine`（§2.4）は実装・テスト済み。L1/L2 の未使用入力は
+生成・凍結済み。W = 2 mHa と B3 対照は確定。計算予算の上限は未定
+（`docs/2026-11-06-paper1-validation-protocol.zh-CN.md` §9）。
 
 検証設定：`--densify-steps 4 --escalate-unknown 2 --screen-margin-mha 5
 --densify-random 40 --shadow-sv 0.999`（ランダム配向は対称起点の探索強化期間にのみ適用）。

@@ -50,7 +50,12 @@ Validation is limited to the existing Fe(II) paths and fixed spin-projection sec
 held-out paths, broader state coverage, and coordination-event tracking remain to be validated.
 The next stage is joint coordination/electronic-lineage tracking on fixed QM paths. Not started:
 XL-BOMD, MM-side gradients / OpenMM coupling, ORCA backend. Search candidates from neighbouring
-multiplicities (M±2) and broken-symmetry solutions are planned after Phase 3b.
+multiplicities (M±2) and broken-symmetry solutions are planned after Phase 3b. The **paper-1
+validation protocol** (2026-11-06) is partly confirmed (2026-11-09): the per-run source snapshot
+(`bench_beam.py` `snapshot_source()`, §2.3) and the L2 held-out system `fe2_pentaaqua_ammine`
+(§2.4) are implemented and tested; the L1/L2 held-out inputs are generated and frozen; W = 2 mHa
+and the B3 control are confirmed; the compute-budget cap is still open
+(`docs/2026-11-06-paper1-validation-protocol.zh-CN.md` §9).
 
 Accepted benchmark options: `--densify-steps 4 --escalate-unknown 2 --screen-margin-mha 5
 --densify-random 40 --shadow-sv 0.999` (`densify-random` acts in the symmetric-start discovery

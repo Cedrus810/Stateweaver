@@ -39,6 +39,10 @@ G2 traj2 60 步 × 4 均为 0 miss / 0 warn，筛选关闭的 traj2 对照也 4 
 验证范围限于已有 FeII 路径与固定自旋投影扇区，独立留出路径、更广的态覆盖与配位事件跟踪尚待验证；
 下一阶段沿既定路线做固定 QM 路径上的配位/电子态联合跟踪。XL-BOMD、
 MM 端梯度 / OpenMM 耦合、ORCA 后端也未开始。相邻多重度（M±2）与破对称候选排在 Phase 3b 之后。
+首篇验证协议（2026-11-06）已部分确认（2026-11-09）：逐运行源码快照（`bench_beam.py`
+`snapshot_source()`，§2.3）与 L2 留出体系 `fe2_pentaaqua_ammine`（§2.4）已实现并有测试；
+L1/L2 留出输入已生成并冻结；W = 2 mHa 与 B3 对照已确认；计算预算上限待定
+（`docs/2026-11-06-paper1-validation-protocol.zh-CN.md` §9）。
 
 验收回放配置：`--densify-steps 4 --escalate-unknown 2 --screen-margin-mha 5
 --densify-random 40 --shadow-sv 0.999`（随机取向只在对称起点的加密窗口生效）。
