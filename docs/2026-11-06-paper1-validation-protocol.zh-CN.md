@@ -1,6 +1,6 @@
 # 首篇验证协议（草稿，未冻结）
 
-日期：2026-11-06。状态：**Claude 起草，待用户确认后冻结**；冻结前不启动本文的新计算。
+日期：2026-11-06。状态：**部分确认**（2026-11-09，见第 9 节）；只剩计算预算上限未定，在此之前每批计算照常先报计划表。
 用户原话（2026-11-06）："先备份六批单份证据，再冻结首篇验证协议。 新运行保存对应源码快照；旧运行如实保留版本缺口。随后补独立留出、全态参考和同预算对照"；对"开始起草首篇验证协议"回复"可以"。
 依据：上位设计稿 §2、§10、§11、§13、§17（state recall 评测）；路线 `docs/2026-10-13-roadmap.zh-CN.md` §1；论文准备度 `docs/2026-10-29-paper-readiness.zh-CN.md` §2–5；Stateweaver 设计 `docs/coordination-electronic-lineage-research-design.zh-CN.md` §9–10；结论汇总 `docs/2026-11-06-phase3b-shadow-round-summary.zh-CN.md`。
 
@@ -31,7 +31,7 @@ UKS/B3LYP、def2-SVP、density fitting、`conv_tol` 1e-7；固定原子集合、
 
 ### 2.3 源码
 
-留出运行开始前：`bench_beam.py` 把 `src/sroqm/*.py` 与 `bench_beam.py` 的 md5 写进 json 的 `run` 字段，并在输出目录放一份源码副本（需先实现并冒烟）。冻结后源码不再改动；若必须改，已跑的留出结果作废或单列，改后的版本需要新的留出数据。
+留出运行开始前：`bench_beam.py` 把 `src/sroqm/*.py` 与 `bench_beam.py` 的 md5 写进 json 的 `run` 字段，并在输出目录放一份源码副本。**已实现（2026-11-09）**：`bench_beam.py` `snapshot_source()`，回放开始前写 `<OUT>.src/`（源码副本 + `MD5SUMS`），json `run.source` = {文件: md5}；`tests/test_bench_beam.py` 端到端检查通过（kasuga02，6 passed）。冻结后源码不再改动；若必须改，已跑的留出结果作废或单列，改后的版本需要新的留出数据。
 
 ### 2.4 开发集与留出集
 
@@ -104,12 +104,24 @@ UKS/B3LYP、def2-SVP、density fitting、`conv_tol` 1e-7；固定原子集合、
 
 资源估计（粗估，依据 traj2 60 步在 12 核上 3.1–3.5 h / 条）：L1 三条 × 4 次 × F 约 40 h·12 核；对照与消融约为其 5–8 倍；全态参考每个几何的候选数是现有搜索的数倍，没有实测，需先冒烟测单几何耗时再估。
 
-## 9. 需要用户定的事项
+## 9. 用户确认的事项与待定
 
-1. 留出集：L1 的条数与步长；L2 选哪个体系（[Fe(H₂O)₅(NH₃)]²⁺、[Co(H₂O)₆]²⁺ 或其他）。
-2. recall 窗口 W（建议 2 mHa，另报 1 mHa）。
-3. 对照组是否包括 B3（Vaucher–Reiher 式随机扰动）；不包括时论文须说明原因与主张限制。
-4. 计算预算上限。
+用户原话（2026-11-09）："好的往下做啊"，回复的是"§9 这 4 项，你看要不要按草稿里的建议定？"。草稿给了单一建议的两项据此定下：
+
+- **recall 窗口**：W = 2 mHa，另报告 W = 1 mHa。
+- **对照组包括 B3**（Vaucher–Reiher 式随机扰动；具体实现见"未确认"第 3 条）。
+- **L1**：[Fe(H₂O)₆]²⁺ 新 NVE 轨迹 3 条，换随机种子，其中 1 条步长 2 fs，每条 60 步。
+  - **已生成并冻结（2026-11-09）**：`benchmarks/out/inputs_l1/l1_s21_coords.npy`、`l1_s31_coords.npy`（1 fs 积分，60 帧；PBS yayoi12）、`l1_s41_coords.npy`（见下），md5 在 `inputs_l1/MD5SUMS`。生成器 `benchmarks/out/gen_l1_traj_20261109.py`（与 traj2 的 `proto_gen_traj.py` 同一做法，种子 / 步长 / 步数 / 输出为参数）。三条 Fe–O 1.98–2.34 Å、O–H 0.83–1.18 Å，驱动全部收敛，总能量漂移 11.2 / 6.9 / 8.1 mHa（traj2 6.1）。
+  - **与原定不同（用户 2026-11-09 回复"可以"）**：种子 41 原定用 2 fs 积分，第 10 步起 O–H 拉断、H 飞出（19 步 SCF 不收敛，保留为 `l1_s41_dt2_failed_*`）；改为 1 fs 积分 119 帧（`l1_s41_dt1x119_*`，183），隔帧取 60 帧，相邻几何间隔 2 fs。检验的仍是 beam 看到的步距变大。
+
+- **L2 体系**：[Fe(H₂O)₅(NH₃)]²⁺（用户 2026-11-09 回复"可以"，回复的是"L2 用 [Fe(H₂O)₅(NH₃)]²⁺ 可以吗？"）。
+  - 构造：`testsystems.fe_pentaaqua_ammine_atoms()` / `build("fe2_pentaaqua_ammine", …)`：六水合物的 +x 水换成 NH₃（Fe–N 2.20 Å、N–H 1.015 Å、Fe–N–H 111°），电荷 2+、Nα−Nβ = 4；`tests/test_testsystems.py` 9 passed（kasuga02）。
+  - **已生成并冻结（2026-11-09，183）**：`benchmarks/out/inputs_l2/l2_sym_s51_coords.npy`（理想几何起步、300 K、1 fs、11 帧，对应开发集的对称起点）与 `l2_nve_s61_coords.npy`（σ 0.05 Å、300 K、1 fs、60 帧，对应 traj2），md5 在 `inputs_l2/MD5SUMS`；生成器 `benchmarks/out/gen_l2_traj_20261109.py`。驱动全部收敛，漂移 1.1 / 3.6 mHa；Fe–N 2.16–2.25、Fe–O 2.05–2.33 Å。
+  - **与预期不同**：理想几何上三种 t₂g 占据已分开（0 / +1.63 / +4.06 mHa，远大于 0.1 mHa 简并带），L2 的对称起点不会被判 DEGENERATE、不触发加密窗口；它检验的是换配体环境，**不检验对称破缺**。对称破缺的留出检验目前没有。
+
+仍待用户定：
+
+- **计算预算上限**。在定之前，每一批计算照常先报计划表。
 
 ## 未确认（Claude 推断）
 
