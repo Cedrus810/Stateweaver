@@ -87,6 +87,16 @@ def save_frame(path, res) -> None:
              manifold=np.array([m[1] for m in res.manifold]))
 
 
+def save_branches(path, res) -> None:
+    """Every ACTIVE lineage of one step (BeamResult.frames), lowest first, for offline scoring against a full-state
+    reference (benchmarks/eval_fullref.py; paper-1 protocol 2026-11-06 §6 recall)."""
+    ids = sorted(res.frames, key=lambda i: res.lineage_energies[i])
+    fs = [res.frames[i] for i in ids]
+    np.savez(path, coords=res.frame.mol.atom_coords(), ids=np.array(ids),
+             energies=np.array([res.lineage_energies[i] for i in ids]), mo_coeff=np.array([f.mo_coeff for f in fs]),
+             mo_occ=np.array([f.mo_occ for f in fs]), selected=res.lineage_id, status=res.status)
+
+
 def peak_rss_mb() -> float:
     """Peak RSS of this process so far, MiB (Linux ru_maxrss is KiB; spec §9 memory requirement, state.md §4.16)."""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
@@ -124,6 +134,7 @@ def replay(beam: BeamEngine, coords_list, ref_dir, prefix: str, tol: Tolerances,
         seconds = time.perf_counter() - t
         if save_dir is not None:
             save_frame(Path(save_dir) / f"{prefix}_{k:03d}.npz", res)
+            save_branches(Path(save_dir) / f"{prefix}_{k:03d}_beam.npz", res)
             if res.search_frames:  # design memo 2026-10-23 §2.2 2a: the start search's converged candidates
                 fs = res.search_frames
                 np.savez(Path(save_dir) / f"{prefix}_{k:03d}_search.npz", coords=fs[0].mol.atom_coords(),
